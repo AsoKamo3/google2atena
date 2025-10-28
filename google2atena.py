@@ -1,4 +1,3 @@
-# google2atena.py
 from flask import Flask, request, render_template_string, send_file
 import pandas as pd
 import io
@@ -8,8 +7,8 @@ app = Flask(__name__)
 
 HTML = """
 <!doctype html>
-<title>Google連絡先CSV → 宛名職人CSV 変換（v3.8.2 full-integrated 電話半角版）</title>
-<h2>Google連絡先CSV → 宛名職人CSV 変換（v3.8.2 full-integrated 電話半角版）</h2>
+<title>Google連絡先CSV → 宛名職人CSV 変換（v3.8.2 safe）</title>
+<h2>Google連絡先CSV → 宛名職人CSV 変換（v3.8.2 safe）</h2>
 <form method=post enctype=multipart/form-data>
   <p><input type=file name=file>
      <input type=submit value="変換開始">
@@ -19,7 +18,7 @@ HTML = """
 {% endif %}
 """
 
-# ======== 電話番号整形 ========
+# ======== 電話番号整形（半角保持） ========
 def normalize_phone(phone):
     if not phone or pd.isna(phone):
         return ""
@@ -32,7 +31,7 @@ def normalize_phone(phone):
         phone = f"{phone[0:3]}-{phone[3:7]}-{phone[7:]}" if phone.startswith("0") else phone
     return phone
 
-# ======== 住所分割 ========
+# ======== 住所分割（単純な最初のスペース区切り＋改行対応） ========
 def split_address(addr):
     if not addr or pd.isna(addr):
         return "", "", ""
@@ -41,7 +40,6 @@ def split_address(addr):
         parts = addr.split(" ", 1)
         return parts[0], parts[1], ""
     else:
-        # fallback: 改行区切り
         parts = re.split(r"[\n\r]", addr)
         parts = [p.strip() for p in parts if p.strip()]
         if len(parts) == 3:
@@ -64,15 +62,15 @@ def convert_google_to_atena(df):
         title = r.get("Organization Title", "")
         note = r.get("Notes", "")
 
-        # メール抽出
+        # メール抽出（NaN対策）
         emails = []
         for i in range(1, 6):
             v = r.get(f"E-mail {i} - Value", "")
-            if v and v not in emails:
-                emails.append(v)
+            if pd.notna(v) and str(v).strip() != "":
+                emails.append(str(v).strip())
         email_str = ";".join(emails)
 
-        # 電話番号抽出
+        # 電話番号抽出（Work > Mobile > Home）
         phone_dict = {}
         for i in range(1, 6):
             label = str(r.get(f"Phone {i} - Label", "")).lower()
@@ -86,7 +84,6 @@ def convert_google_to_atena(df):
             elif "home" in label:
                 phone_dict.setdefault("home", []).append(value)
 
-        # 優先順位 Work > Mobile > Home
         phones = []
         for k in ["work", "mobile", "home"]:
             if k in phone_dict:
@@ -99,15 +96,15 @@ def convert_google_to_atena(df):
         region = str(r.get("Address 1 - Region", "")).replace("-", "－")
         addr1, addr2, addr3 = split_address(addr_full)
 
-        # メモ関連
-        memos = {}
-        for i in range(1, 6):
-            memos[f"メモ{i}"] = ""
+        # メモ関連（NaN回避）
+        memos = {f"メモ{i}": "" for i in range(1, 6)}
         for k in r.keys():
             if "メモ" in str(k):
                 for i in range(1, 6):
                     if f"メモ{i}" in k:
-                        memos[f"メモ{i}"] = str(r[k])
+                        v = r[k]
+                        if pd.notna(v):
+                            memos[f"メモ{i}"] = str(v)
 
         rows.append({
             "姓": last, "名": first, "姓かな": last_kana, "名かな": first_kana,
@@ -131,7 +128,8 @@ def upload_file():
         if not file:
             return render_template_string(HTML, download_link=None)
 
-        df = pd.read_csv(file)
+        # UTF-8優先、他エンコーディングは無視
+        df = pd.read_csv(file, encoding="utf-8", errors="ignore")
         result = convert_google_to_atena(df)
 
         buf = io.BytesIO()

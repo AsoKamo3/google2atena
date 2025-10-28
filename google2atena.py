@@ -104,10 +104,17 @@ def collect_phones(row):
 # ============ Memo / Notes ============
 
 def normalize_label(s):
-    if not s: return ""
-    s=str(s).strip()
-    s=s.translate(str.maketrans("①②③④⑤１２３４５","12345"))
-    return re.sub(r"\s+","",s)
+    if not s:
+        return ""
+    s = str(s).strip()
+    # 全角数字や丸数字を半角に変換
+    table = str.maketrans({
+        "①": "1", "②": "2", "③": "3", "④": "4", "⑤": "5",
+        "１": "1", "２": "2", "３": "3", "４": "4", "５": "5"
+    })
+    s = s.translate(table)
+    s = re.sub(r"\s+", "", s)
+    return s
 
 def collect_memo_and_notes(row):
     memos={f"メモ{i}":"" for i in range(1,6)}

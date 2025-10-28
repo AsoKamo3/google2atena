@@ -7,45 +7,38 @@ from datetime import datetime
 app = Flask(__name__)
 
 # =========================================================
-# 住所の最初のスペース以降を建物名・階層・号室として扱う簡潔ロジック
+# ユーティリティ
 # =========================================================
 def to_zenkaku(s: str) -> str:
-    """半角英数字・カナを全角へ"""
     if not s:
         return ""
     table = str.maketrans({
-        **{chr(i): chr(i + 0xFEE0) for i in range(0x21, 0x7F)},  # 英数
+        **{chr(i): chr(i + 0xFEE0) for i in range(0x21, 0x7F)},
         " ": "　"
     })
     return s.translate(table)
 
 def normalize_address(addr: str):
-    """住所を最初のスペース（半角 or 全角）で二分割"""
+    """最初のスペースで2分割"""
     if not addr:
         return "", ""
     s = to_zenkaku(addr.strip())
-    parts = re.split(r"[ 　]+", s, 1)  # 最初のスペースで1回だけ分割
+    parts = re.split(r"[ 　]+", s, 1)
     if len(parts) == 1:
         return parts[0], ""
     return parts[0], parts[1]
 
-
-# =========================================================
-# 会社名かな（法人格除外・全角カタカナ変換）
-# =========================================================
 def company_name_kana(name: str) -> str:
-    """会社名から法人格を除外し、カタカナ化"""
     if not name:
         return ""
     name = re.sub(r"(株式会社|有限会社|合同会社|一般社団法人|一般財団法人|学校法人|医療法人|社会福祉法人)", "", name)
     name = to_zenkaku(name)
-    # ひらがな→カタカナ
     name = re.sub(r"[ぁ-ん]", lambda m: chr(ord(m.group(0)) + 0x60), name)
     return name
 
 
 # =========================================================
-# Flaskルート
+# Flask ルート
 # =========================================================
 @app.route('/')
 def index():
@@ -58,13 +51,13 @@ def convert():
     if not file:
         return jsonify({"error": "ファイルが選択されていません"}), 400
 
+    # Google CSV はカンマ区切り
     input_stream = io.StringIO(file.stream.read().decode('utf-8-sig'))
-    reader = csv.DictReader(input_stream, delimiter='\t')
+    reader = csv.DictReader(input_stream, delimiter=',')
 
     output = io.StringIO()
     writer = csv.writer(output, delimiter='\t', lineterminator='\n')
 
-    # 理想の出力ヘッダー順
     headers = [
         "姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな",
         "敬称","ニックネーム","旧姓","宛先","自宅〒","自宅住所1","自宅住所2","自宅住所3",
@@ -80,38 +73,42 @@ def convert():
     writer.writerow(headers)
 
     for row in reader:
-        sei = row.get("姓", "")
-        mei = row.get("名", "")
-        sei_kana = row.get("せい", "")
-        mei_kana = row.get("めい", "")
+        # 英語と日本語の両ヘッダーに対応
+        sei = row.get("姓") or row.get("Family Name", "")
+        mei = row.get("名") or row.get("Given Name", "")
+        sei_kana = row.get("せい") or row.get("Phonetic Last Name", "")
+        mei_kana = row.get("めい") or row.get("Phonetic First Name", "")
         full = f"{sei}　{mei}".strip()
         full_kana = f"{sei_kana}　{mei_kana}".strip()
-        nickname = row.get("ニックネーム", "")
-        company = row.get("株式会社社名", "") or row.get("会社名", "")
-        dept = row.get("部署", "")
-        title = row.get("肩書き", "")
-        birthday = row.get("誕生日", "")
-        note = row.get("ノート", "")
-        memo1 = row.get("メモ1", "")
-        memo2 = row.get("メモ2", "")
-        memo3 = row.get("メモ3", "")
-        memo4 = row.get("メモ4", "")
-        memo5 = row.get("メモ5", "")
+
+        nickname = row.get("ニックネーム") or row.get("Nickname", "")
+        company = row.get("株式会社社名") or row.get("Organization Name", "")
+        dept = row.get("部署") or row.get("Organization Department", "")
+        title = row.get("肩書き") or row.get("Organization Title", "")
+        birthday = row.get("誕生日") or row.get("Birthday", "")
+        note = row.get("ノート") or row.get("Notes", "")
+
+        memo1 = row.get("メモ1") or row.get("Relation 1 - Value", "")
+        memo2 = row.get("メモ2") or row.get("Relation 2 - Value", "")
+        memo3 = row.get("メモ3") or row.get("Relation 3 - Value", "")
+        memo4 = row.get("メモ4") or row.get("Relation 4 - Value", "")
+        memo5 = row.get("メモ5") or row.get("Relation 5 - Value", "")
 
         addr = row.get("Address 1 - Street", "")
         addr1, addr2 = normalize_address(addr)
 
         company_kana = company_name_kana(company)
 
-        # 各種連絡先（会社・自宅メール/電話）
         company_phones = ";".join([
             row.get("Phone 1 - Value", ""),
             row.get("Phone 2 - Value", "")
         ]).strip(";")
+
         company_emails = ";".join([
             row.get("E-mail 1 - Value", ""),
             row.get("E-mail 2 - Value", "")
         ]).strip(";")
+
         home_emails = row.get("E-mail 3 - Value", "")
 
         writer.writerow([

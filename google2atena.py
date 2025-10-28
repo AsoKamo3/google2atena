@@ -1,15 +1,14 @@
-# google2atena.py
-# Google連絡先CSV → 宛名職人CSV 変換（v3.9.5 full-format no-pandas 最終安定版）
+# google2atena_v396.py
+# Google連絡先CSV → 宛名職人CSV 変換
+# v3.9.6 full-format no-pandas refined stable版
 
 from flask import Flask, request, render_template_string, send_file
-import csv
-import io
-import re
+import csv, io, re
 from collections import OrderedDict
 
 app = Flask(__name__)
 
-TITLE = "Google連絡先CSV → 宛名職人CSV 変換（v3.9.5 full-format no-pandas 最終安定版）"
+TITLE = "Google連絡先CSV → 宛名職人CSV 変換（v3.9.6 refined stable）"
 
 HTML = f"""
 <!doctype html>
@@ -20,15 +19,14 @@ HTML = f"""
   <p><input type="file" name="file" accept=".csv">
      <input type="submit" value="変換開始">
 </form>
-<p style="font-size:12px;color:#666;">
-  ・Google連絡先CSVに対応（BOMあり/なし）<br>
-  ・「メモゆれ対応」「Notes→備考1」「住所全角化」「電話NTT整形」「会社名かな辞書対応」
+<p style="font-size:12px;color:#555;">
+・Google連絡先CSV（BOMあり/なし）対応<br>
+・「メモ抽出(Label/Value対応)」「Notes→備考1」「会社名かな法人格除去＋英字読み」<br>
+・pandas不使用／Render対応済
 </p>
 """
 
-# =====================
-# Utility Functions
-# =====================
+# ============ Utility ============
 
 def coalesce(*vals):
     for v in vals:
@@ -36,274 +34,188 @@ def coalesce(*vals):
             return str(v).strip()
     return ""
 
-# 半角→全角（住所用）
-def to_fullwidth_address(s):
-    if not s:
-        return ""
-    s = str(s)
+def to_fullwidth(s):
+    if not s: return ""
     fw = str.maketrans({chr(i): chr(i + 0xFEE0) for i in range(0x21, 0x7F)})
-    s = s.translate(fw)
-    s = s.replace(" ", "　").replace("-", "－").replace("#", "＃")
-    return s
+    return str(s).translate(fw).replace(" ", "　")
 
-# 郵便番号を半角化（XXX-XXXX）
-def to_halfwidth_postal(s):
-    if not s:
-        return ""
+def to_half_postal(s):
+    if not s: return ""
     digits = re.sub(r"\D", "", str(s))
-    if len(digits) == 7:
-        return f"{digits[:3]}-{digits[3:]}"
-    return digits
+    return f"{digits[:3]}-{digits[3:]}" if len(digits)==7 else digits
 
-# 電話番号をNTT形式に
-def format_jp_phone(num):
-    if not num:
-        return ""
+def format_phone(num):
+    if not num: return ""
     digits = re.sub(r"\D", "", str(num))
-    if digits and digits[0] != "0" and len(digits) in (9, 10):
-        digits = "0" + digits
-    if len(digits) == 11:
-        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
-    if len(digits) == 10:
-        if digits.startswith(("03", "06")):
-            return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
-        else:
-            return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    if digits and digits[0]!="0" and len(digits) in (9,10): digits="0"+digits
+    if len(digits)==11: return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    if len(digits)==10:
+        return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}" if digits.startswith(("03","06")) \
+               else f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
     return digits
 
-# =====================
-# Address Parsing
-# =====================
+# ============ Address ============
 
-def parse_formatted_address(row):
+def parse_address(row):
     postal_raw = coalesce(row.get("Address 1 - Postal Code"))
     region = coalesce(row.get("Address 1 - Region"))
     city = coalesce(row.get("Address 1 - City"))
     street = coalesce(row.get("Address 1 - Street"))
-
-    # fallback
     if not (region and city and street):
         formatted = coalesce(row.get("Address 1 - Formatted"))
         if formatted:
-            lines = [l.strip() for l in re.split(r"[\r\n]+", formatted) if l.strip()]
-            if len(lines) >= 1 and not street:
-                street = lines[0]
-            if len(lines) >= 2 and not city:
-                city = lines[1]
-            if len(lines) >= 3 and not region:
-                if re.search(r"[都道府県]$", lines[2]):
-                    region = lines[2]
-            if len(lines) >= 4 and not postal_raw:
-                postal_raw = lines[3]
-
-    postal = to_halfwidth_postal(postal_raw)
-
+            lines=[l.strip() for l in re.split(r"[\r\n]+", formatted) if l.strip()]
+            if len(lines)>=1 and not street: street=lines[0]
+            if len(lines)>=2 and not city: city=lines[1]
+            if len(lines)>=3 and not region: region=lines[2]
+            if len(lines)>=4 and not postal_raw: postal_raw=lines[3]
+    postal = to_half_postal(postal_raw)
     addr_num, bldg = street, ""
     if street and re.search(r"[ 　]", street):
         idx = re.search(r"[ 　]", street).start()
-        addr_num = street[:idx].strip()
-        bldg = street[idx:].strip()
+        addr_num, bldg = street[:idx].strip(), street[idx:].strip()
+    addr1 = to_fullwidth(region+city+addr_num)
+    addr2 = to_fullwidth(bldg)
+    return postal, addr1, addr2, ""
 
-    addr1 = to_fullwidth_address(region + city + addr_num)
-    addr2 = to_fullwidth_address(bldg)
-    addr3 = ""
-    return postal, addr1, addr2, addr3
-
-# =====================
-# Email & Phone
-# =====================
-
-def split_emails(value):
-    if not value:
-        return []
-    s = str(value).replace(":::", ";").replace("；", ";").replace("，", ",")
-    parts = re.split(r"[;,\s]+", s)
-    return [p.strip().lower() for p in parts if "@" in p]
+# ============ Email / Phone ============
 
 def collect_emails(row):
-    emails = []
-    for i in range(1, 8):
-        v = row.get(f"E-mail {i} - Value", "")
-        if v:
-            emails += split_emails(v)
-    return ";".join(dict.fromkeys(emails))
+    emails=[]
+    for i in range(1,8):
+        v=row.get(f"E-mail {i} - Value","")
+        if v: emails += re.split(r"[;,\s:]+",v)
+    seen=[]
+    for e in emails:
+        e=e.strip()
+        if e and "@" in e and e not in seen: seen.append(e)
+    return ";".join(seen)
 
-def label_rank(label):
-    l = str(label).lower()
-    if "work" in l: return 0
-    if "mobile" in l: return 1
-    if "home" in l: return 2
-    return 3
-
-def pick_company_phones(row):
-    buckets = {0: [], 1: [], 2: [], 3: []}
-    for i in range(1, 8):
-        lbl = row.get(f"Phone {i} - Label", "")
-        val = row.get(f"Phone {i} - Value", "")
+def collect_phones(row):
+    phones=[]
+    for i in range(1,8):
+        val=row.get(f"Phone {i} - Value","")
         if not val: continue
-        raw_list = re.split(r"::+|;|,|\s+", str(val))
-        for raw in raw_list:
-            fmt = format_jp_phone(raw.strip())
-            if fmt:
-                buckets[label_rank(lbl)].append(fmt)
-    seen, out = set(), []
-    for k in (0,1,2,3):
-        for p in buckets[k]:
-            if p not in seen:
-                seen.add(p)
-                out.append(p)
-    return ";".join(out)
+        for part in re.split(r"[;,\s:]+",val):
+            fmt=format_phone(part)
+            if fmt and fmt not in phones: phones.append(fmt)
+    return ";".join(phones)
 
-# =====================
-# Memo & Notes Handling
-# =====================
+# ============ Memo / Notes ============
 
-def collect_memos_and_notes(row):
-    memos = {f"メモ{i}": "" for i in range(1, 6)}
-    notes_out = coalesce(row.get("Notes", ""))
+def normalize_label(s):
+    if not s: return ""
+    s=str(s).strip()
+    s=s.translate(str.maketrans("①②③④⑤１２３４５","12345"))
+    return re.sub(r"\s+","",s)
 
-    for key, val in row.items():
+def collect_memo_and_notes(row):
+    memos={f"メモ{i}":"" for i in range(1,6)}
+    # Relation n - Label / Value
+    for i in range(1,10):
+        lbl=normalize_label(row.get(f"Relation {i} - Label",""))
+        val=row.get(f"Relation {i} - Value","")
         if not val: continue
-        k = key.strip()
-        m = re.search(r"(?:メモ|memo|ＭＥＭＯ)\s*([①②③④⑤１２３４５1-5])", k, re.IGNORECASE)
+        m=re.search(r"(?:メモ|memo)([1-5]?)",lbl,re.IGNORECASE)
         if m:
-            n = m.group(1)
-            n = n.translate(str.maketrans("①②③④⑤１２３４５", "12345"))
-            memos[f"メモ{n}"] = str(val)
-    return memos, notes_out
+            idx=m.group(1) or None
+            if idx and f"メモ{idx}" in memos:
+                memos[f"メモ{idx}"]=val.strip()
+            else:
+                # 未指定の場合は空きスロットに
+                for k in memos:
+                    if not memos[k]:
+                        memos[k]=val.strip(); break
+    notes=coalesce(row.get("Notes",""))
+    return memos, notes
 
-# =====================
-# Company Name Kana
-# =====================
+# ============ Company Kana ============
 
-COMPANY_KANA_DICT = [
-    ("ＮＨＫ", "エヌエイチケー"),
-    ("日経", "ニッケイ"),
-    ("博報堂", "ハクホウドウ"),
-    ("講談社", "コウダンシャ"),
-    ("東京", "トウキョウ"),
-    ("湘南", "ショウナン"),
-    ("夢眠社", "ユメミシャ"),
-    ("ライズ＆プレイ", "ライズアンドプレイ"),
-    ("河野文庫", "コウノブンコ"),
+COMPANY_REPLACE = [
+    ("ＮＨＫ","エヌエイチケー"),("日経","ニッケイ"),("博報堂","ハクホウドウ"),
+    ("講談社","コウダンシャ"),("テレビ東京","テレビトウキョウ"),
+    ("夢眠社","ユメミシャ"),("ライズ＆プレイ","ライズアンドプレイ"),
+    ("河野文庫","コウノブンコ"),("東京","トウキョウ"),("湘南","ショウナン")
 ]
-
-ENGLISH_KANA_MAP = {
-    "BP": "ビーピー", "DY": "ディーワイ", "LAB": "ラボ", "WORKS": "ワークス",
-    "INC": "インク", "CORP": "コープ", "CO": "シーオー", "LTD": "エルティーディー",
+ENGLISH_MAP={
+    "NHK":"エヌエイチケー","DY":"ディーワイ","BP":"ビーピー","TV":"ティーブイ",
+    "INC":"インク","CORP":"コープ","CO":"シーオー","LTD":"エルティーディー"
 }
 
-def to_company_kana(org_name):
-    if not org_name:
-        return ""
-    s = to_fullwidth_address(org_name)
-    for k, v in COMPANY_KANA_DICT:
-        if k in s:
-            s = s.replace(k, v)
-    for k, v in ENGLISH_KANA_MAP.items():
-        s = re.sub(rf"\b{k}\b", v, s, flags=re.IGNORECASE)
+def to_company_kana(org):
+    if not org: return ""
+    s=str(org)
+    s=re.sub(r"㈱|株式会社|有限会社|合同会社|社団法人|学校法人","",s)
+    s=s.strip()
+    s=to_fullwidth(s)
+    for k,v in COMPANY_REPLACE:
+        if k in s: s=s.replace(k,v)
+    for k,v in ENGLISH_MAP.items():
+        s=re.sub(rf"\b{k}\b",v,s,flags=re.IGNORECASE)
     return s
 
-# =====================
-# Row Conversion
-# =====================
+# ============ Conversion ============
 
-OUT_COLUMNS = [
-    "姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな","敬称","ニックネーム","旧姓","宛先",
-    "自宅〒","自宅住所1","自宅住所2","自宅住所3","自宅電話","自宅IM ID","自宅E-mail","自宅URL","自宅Social",
-    "会社〒","会社住所1","会社住所2","会社住所3","会社電話","会社IM ID","会社E-mail","会社URL","会社Social",
-    "その他〒","その他住所1","その他住所2","その他住所3","その他電話","その他IM ID","その他E-mail","その他URL","その他Social",
-    "会社名かな","会社名","部署名1","部署名2","役職名","連名","連名ふりがな","連名敬称","連名誕生日",
-    "メモ1","メモ2","メモ3","メモ4","メモ5","備考1","備考2","備考3","誕生日","性別","血液型","趣味","性格"
+OUT_COLS=[
+"姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな","敬称","ニックネーム","旧姓","宛先",
+"自宅〒","自宅住所1","自宅住所2","自宅住所3","自宅電話","自宅IM ID","自宅E-mail","自宅URL","自宅Social",
+"会社〒","会社住所1","会社住所2","会社住所3","会社電話","会社IM ID","会社E-mail","会社URL","会社Social",
+"その他〒","その他住所1","その他住所2","その他住所3","その他電話","その他IM ID","その他E-mail","その他URL","その他Social",
+"会社名かな","会社名","部署名1","部署名2","役職名","連名","連名ふりがな","連名敬称","連名誕生日",
+"メモ1","メモ2","メモ3","メモ4","メモ5","備考1","備考2","備考3","誕生日","性別","血液型","趣味","性格"
 ]
 
-def convert_row(row):
-    first, last = row.get("First Name",""), row.get("Last Name","")
-    first_kana, last_kana = row.get("Phonetic First Name",""), row.get("Phonetic Last Name","")
-    middle, middle_kana = row.get("Middle Name",""), row.get("Phonetic Middle Name","")
-    nickname, birthday = row.get("Nickname",""), row.get("Birthday","")
-    org, dept, title = row.get("Organization Name",""), row.get("Organization Department",""), row.get("Organization Title","")
+def convert_row(r):
+    first,last=r.get("First Name",""),r.get("Last Name","")
+    first_kana,last_kana=r.get("Phonetic First Name",""),r.get("Phonetic Last Name","")
+    middle,middle_kana=r.get("Middle Name",""),r.get("Phonetic Middle Name","")
+    nickname,birthday=r.get("Nickname",""),r.get("Birthday","")
+    org,dept,title=r.get("Organization Name",""),r.get("Organization Department",""),r.get("Organization Title","")
+    postal,addr1,addr2,addr3=parse_address(r)
+    phones,emails=collect_phones(r),collect_emails(r)
+    memos,notes=collect_memo_and_notes(r)
+    org_kana=to_company_kana(org)
 
-    postal, addr1, addr2, addr3 = parse_formatted_address(row)
-    phone_str = pick_company_phones(row)
-    email_str = collect_emails(row)
-    memos, notes1 = collect_memos_and_notes(row)
-    org_kana = to_company_kana(org)
+    out=OrderedDict()
+    out["姓"]=last; out["名"]=first
+    out["姓かな"]=last_kana; out["名かな"]=first_kana
+    out["姓名"]=f"{last}　{first}".strip()
+    out["姓名かな"]=f"{last_kana}　{first_kana}".strip()
+    out["ミドルネーム"]=middle; out["ミドルネームかな"]=middle_kana
+    out["敬称"]="様"; out["ニックネーム"]=nickname; out["旧姓"]=""
+    out["宛先"]="会社"
+    for c in OUT_COLS[12:21]: out[c]=""
+    out["会社〒"]=postal; out["会社住所1"]=addr1; out["会社住所2"]=addr2; out["会社住所3"]=addr3
+    out["会社電話"]=phones; out["会社IM ID"]=""
+    out["会社E-mail"]=emails; out["会社URL"]=out["会社Social"]=""
+    for c in OUT_COLS[30:39]: out[c]=""
+    out["会社名かな"]=org_kana; out["会社名"]=org; out["部署名1"]=dept
+    out["部署名2"]="" ; out["役職名"]=title
+    for f in ("連名","連名ふりがな","連名敬称","連名誕生日"): out[f]=""
+    for i in range(1,6): out[f"メモ{i}"]=memos[f"メモ{i}"]
+    out["備考1"]=notes; out["備考2"]=out["備考3"]=""
+    out["誕生日"]=birthday; out["性別"]="選択なし"; out["血液型"]="選択なし"
+    out["趣味"]=out["性格"]=""
+    return OrderedDict((k,out.get(k,"")) for k in OUT_COLS)
 
-    out = OrderedDict()
-    out["姓"] = last
-    out["名"] = first
-    out["姓かな"] = last_kana
-    out["名かな"] = first_kana
-    out["姓名"] = f"{last}　{first}".strip()
-    out["姓名かな"] = f"{last_kana}　{first_kana}".strip()
-    out["ミドルネーム"] = middle
-    out["ミドルネームかな"] = middle_kana
-    out["敬称"] = "様"
-    out["ニックネーム"] = nickname
-    out["旧姓"] = ""
-    out["宛先"] = "会社"
-
-    # 自宅系は空欄
-    for col in OUT_COLUMNS[12:21]:
-        out[col] = ""
-
-    # 会社
-    out["会社〒"] = postal
-    out["会社住所1"] = addr1
-    out["会社住所2"] = addr2
-    out["会社住所3"] = addr3
-    out["会社電話"] = phone_str
-    out["会社IM ID"] = ""
-    out["会社E-mail"] = email_str
-    out["会社URL"] = ""
-    out["会社Social"] = ""
-
-    for col in OUT_COLUMNS[30:39]:
-        out[col] = ""
-
-    out["会社名かな"] = org_kana
-    out["会社名"] = org
-    out["部署名1"] = dept
-    out["部署名2"] = ""
-    out["役職名"] = title
-    out["連名"] = out["連名ふりがな"] = out["連名敬称"] = out["連名誕生日"] = ""
-
-    for i in range(1,6):
-        out[f"メモ{i}"] = memos[f"メモ{i}"]
-
-    out["備考1"] = notes1
-    out["備考2"] = out["備考3"] = ""
-    out["誕生日"] = birthday
-    out["性別"] = "選択なし"
-    out["血液型"] = "選択なし"
-    out["趣味"] = out["性格"] = ""
-    return OrderedDict((k, out.get(k, "")) for k in OUT_COLUMNS)
-
-def convert_google_to_atena(csv_text):
-    reader = csv.DictReader(io.StringIO(csv_text))
+def convert_google_to_atena(text):
+    reader=csv.DictReader(io.StringIO(text))
     return [convert_row(r) for r in reader]
 
-# =====================
-# Flask Endpoint
-# =====================
+# ============ Flask ============
 
-@app.route("/", methods=["GET", "POST"])
-def upload_file():
-    if request.method == "POST":
-        f = request.files.get("file")
+@app.route("/",methods=["GET","POST"])
+def upload():
+    if request.method=="POST":
+        f=request.files.get("file")
         if not f: return render_template_string(HTML)
-        raw = f.read()
-        text = raw.decode("utf-8-sig", errors="replace")
-        rows = convert_google_to_atena(text)
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=OUT_COLUMNS, lineterminator="\n")
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-        data = buf.getvalue().encode("utf-8-sig")
-        return send_file(io.BytesIO(data), as_attachment=True, download_name="google_converted.csv", mimetype="text/csv")
+        raw=f.read(); text=raw.decode("utf-8-sig",errors="replace")
+        rows=convert_google_to_atena(text)
+        buf=io.StringIO(); w=csv.DictWriter(buf,fieldnames=OUT_COLS,lineterminator="\n")
+        w.writeheader(); [w.writerow(r) for r in rows]
+        data=buf.getvalue().encode("utf-8-sig")
+        return send_file(io.BytesIO(data),as_attachment=True,download_name="google_converted.csv",mimetype="text/csv")
     return render_template_string(HTML)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=10000)

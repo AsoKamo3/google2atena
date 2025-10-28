@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string, send_file
-import pandas as pd
+import csv
 import io
 import re
 
@@ -7,52 +7,44 @@ app = Flask(__name__)
 
 HTML = """
 <!doctype html>
-<title>Google連絡先CSV → 宛名職人CSV 変換（v3.8.2 safe）</title>
-<h2>Google連絡先CSV → 宛名職人CSV 変換（v3.8.2 safe）</h2>
+<title>Google連絡先CSV → 宛名職人CSV 変換（v3.8.2 no-pandas safe）</title>
+<h2>Google連絡先CSV → 宛名職人CSV 変換（v3.8.2 no-pandas safe）</h2>
 <form method=post enctype=multipart/form-data>
   <p><input type=file name=file>
      <input type=submit value="変換開始">
 </form>
-{% if download_link %}
-  <p><a href="{{ download_link }}">変換後CSVをダウンロード</a></p>
-{% endif %}
 """
 
-# ======== 電話番号整形（半角保持） ========
+# ======== 電話番号整形 ========
 def normalize_phone(phone):
-    if not phone or pd.isna(phone):
+    if not phone:
         return ""
-    phone = str(phone)
-    phone = re.sub(r"[^\d]", "", phone)  # 数字以外を除去
-    # 国内番号: 10桁 or 11桁
+    phone = re.sub(r"[^\d]", "", str(phone))
     if len(phone) == 10:
-        phone = f"{phone[0:2]}-{phone[2:6]}-{phone[6:]}" if phone.startswith("0") else phone
+        phone = f"{phone[:2]}-{phone[2:6]}-{phone[6:]}" if phone.startswith("0") else phone
     elif len(phone) == 11:
-        phone = f"{phone[0:3]}-{phone[3:7]}-{phone[7:]}" if phone.startswith("0") else phone
+        phone = f"{phone[:3]}-{phone[3:7]}-{phone[7:]}" if phone.startswith("0") else phone
     return phone
 
-# ======== 住所分割（単純な最初のスペース区切り＋改行対応） ========
+# ======== 住所分割 ========
 def split_address(addr):
-    if not addr or pd.isna(addr):
+    if not addr:
         return "", "", ""
-    addr = str(addr).replace("　", " ").strip()
+    addr = addr.replace("　", " ").strip()
     if " " in addr:
         parts = addr.split(" ", 1)
         return parts[0], parts[1], ""
-    else:
-        parts = re.split(r"[\n\r]", addr)
-        parts = [p.strip() for p in parts if p.strip()]
-        if len(parts) == 3:
-            return parts[1], parts[0], parts[2]
-        elif len(parts) == 2:
-            return parts[1], parts[0], ""
-        else:
-            return addr, "", ""
+    parts = [p.strip() for p in re.split(r"[\n\r]", addr) if p.strip()]
+    if len(parts) == 3:
+        return parts[1], parts[0], parts[2]
+    elif len(parts) == 2:
+        return parts[1], parts[0], ""
+    return addr, "", ""
 
 # ======== メイン変換 ========
-def convert_google_to_atena(df):
+def convert_google_to_atena(reader):
     rows = []
-    for _, r in df.iterrows():
+    for r in reader:
         first = r.get("First Name", "")
         last = r.get("Last Name", "")
         first_kana = r.get("Phonetic First Name", "")
@@ -62,18 +54,18 @@ def convert_google_to_atena(df):
         title = r.get("Organization Title", "")
         note = r.get("Notes", "")
 
-        # メール抽出（NaN対策）
+        # メール抽出
         emails = []
         for i in range(1, 6):
             v = r.get(f"E-mail {i} - Value", "")
-            if pd.notna(v) and str(v).strip() != "":
-                emails.append(str(v).strip())
+            if v and v.strip():
+                emails.append(v.strip())
         email_str = ";".join(emails)
 
-        # 電話番号抽出（Work > Mobile > Home）
+        # 電話番号抽出
         phone_dict = {}
         for i in range(1, 6):
-            label = str(r.get(f"Phone {i} - Label", "")).lower()
+            label = (r.get(f"Phone {i} - Label", "") or "").lower()
             value = normalize_phone(r.get(f"Phone {i} - Value", ""))
             if not value:
                 continue
@@ -90,35 +82,47 @@ def convert_google_to_atena(df):
                 phones.extend(phone_dict[k])
         phone_str = ";".join(sorted(set(phones)))
 
-        # 住所分割
+        # 住所処理
         addr_full = r.get("Address 1 - Street", "") or r.get("Address 1 - Formatted", "")
-        zip_code = str(r.get("Address 1 - Postal Code", "")).replace("-", "－")
-        region = str(r.get("Address 1 - Region", "")).replace("-", "－")
+        zip_code = (r.get("Address 1 - Postal Code", "") or "").replace("-", "－")
+        region = (r.get("Address 1 - Region", "") or "").replace("-", "－")
         addr1, addr2, addr3 = split_address(addr_full)
 
-        # メモ関連（NaN回避）
+        # メモ
         memos = {f"メモ{i}": "" for i in range(1, 6)}
-        for k in r.keys():
-            if "メモ" in str(k):
+        for k, v in r.items():
+            if "メモ" in k and v:
                 for i in range(1, 6):
                     if f"メモ{i}" in k:
-                        v = r[k]
-                        if pd.notna(v):
-                            memos[f"メモ{i}"] = str(v)
+                        memos[f"メモ{i}"] = v
 
         rows.append({
-            "姓": last, "名": first, "姓かな": last_kana, "名かな": first_kana,
-            "姓名": f"{last}　{first}".strip(), "姓名かな": f"{last_kana}　{first_kana}".strip(),
-            "敬称": "様", "宛先": "会社",
-            "会社〒": zip_code, "会社住所1": region + addr1, "会社住所2": addr2, "会社住所3": addr3,
+            "姓": last,
+            "名": first,
+            "姓かな": last_kana,
+            "名かな": first_kana,
+            "姓名": f"{last}　{first}".strip(),
+            "姓名かな": f"{last_kana}　{first_kana}".strip(),
+            "敬称": "様",
+            "宛先": "会社",
+            "会社〒": zip_code,
+            "会社住所1": region + addr1,
+            "会社住所2": addr2,
+            "会社住所3": addr3,
             "会社電話1〜10": phone_str,
             "会社E-mail1〜5": email_str,
-            "会社名": org, "部署名1": dept, "役職名": title,
-            "メモ1": memos["メモ1"], "メモ2": memos["メモ2"], "メモ3": memos["メモ3"],
-            "メモ4": memos["メモ4"], "メモ5": memos["メモ5"],
-            "備考1": note, "誕生日": r.get("Birthday", ""),
+            "会社名": org,
+            "部署名1": dept,
+            "役職名": title,
+            "メモ1": memos["メモ1"],
+            "メモ2": memos["メモ2"],
+            "メモ3": memos["メモ3"],
+            "メモ4": memos["メモ4"],
+            "メモ5": memos["メモ5"],
+            "備考1": note,
+            "誕生日": r.get("Birthday", ""),
         })
-    return pd.DataFrame(rows)
+    return rows
 
 # ======== Flaskルート ========
 @app.route("/", methods=["GET", "POST"])
@@ -126,19 +130,29 @@ def upload_file():
     if request.method == "POST":
         file = request.files["file"]
         if not file:
-            return render_template_string(HTML, download_link=None)
+            return render_template_string(HTML)
 
-        # UTF-8優先、他エンコーディングは無視
-        df = pd.read_csv(file, encoding="utf-8", errors="ignore")
-        result = convert_google_to_atena(df)
+        # エンコーディング自動フォールバック
+        try:
+            text = file.read().decode("utf-8")
+        except UnicodeDecodeError:
+            file.seek(0)
+            text = file.read().decode("utf-16")
 
-        buf = io.BytesIO()
-        result.to_csv(buf, index=False, encoding="utf-8-sig")
-        buf.seek(0)
-        return send_file(buf, as_attachment=True, download_name="google_converted.csv", mimetype="text/csv")
+        reader = csv.DictReader(io.StringIO(text))
+        result_rows = convert_google_to_atena(reader)
 
-    return render_template_string(HTML, download_link=None)
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=result_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(result_rows)
 
+        mem = io.BytesIO()
+        mem.write(output.getvalue().encode("utf-8-sig"))
+        mem.seek(0)
+        return send_file(mem, as_attachment=True, download_name="google_converted.csv", mimetype="text/csv")
+
+    return render_template_string(HTML)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

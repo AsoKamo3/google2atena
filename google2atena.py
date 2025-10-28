@@ -1,53 +1,45 @@
-# google2atena.py
-# Google連絡先のエクスポートCSVを宛名職人形式に変換するWebアプリ（Flask版）
+# google2atena_v2.py
+# Google連絡先CSV → 宛名職人形式CSV（完全対応版）
 
 import io, csv, os, re
 from flask import Flask, render_template, request, send_file, abort
 
 app = Flask(__name__)
 
-# ======================
-# 文字種変換ユーティリティ
-# ======================
+# =============== 基本ユーティリティ ===============
 
 FULLWIDTH_OFFSET = ord("！") - ord("!")
-ASCII_MIN, ASCII_MAX = 33, 126
-
 def to_zenkaku(s):
     if not isinstance(s, str): return ""
-    result = []
+    res = []
     for ch in s:
         code = ord(ch)
         if ch == " ":
-            result.append("　")
+            res.append("　")
         elif 33 <= code <= 126:
-            result.append(chr(code + FULLWIDTH_OFFSET))
+            res.append(chr(code + FULLWIDTH_OFFSET))
         else:
-            result.append(ch)
-    return "".join(result)
+            res.append(ch)
+    return "".join(res)
 
 def to_hankaku(s):
     if not isinstance(s, str): return ""
-    result = []
+    res = []
     for ch in s:
         if ch == "　":
-            result.append(" ")
+            res.append(" ")
             continue
         code = ord(ch)
         if 65281 <= code <= 65374:
-            result.append(chr(code - FULLWIDTH_OFFSET))
+            res.append(chr(code - FULLWIDTH_OFFSET))
         else:
-            result.append(ch)
-    return "".join(result)
+            res.append(ch)
+    return "".join(res)
 
 def normalize_half(s):
-    """郵便番号・電話・メールを半角化"""
-    s = (s or "")
-    return to_hankaku(s.strip())
+    return to_hankaku((s or "").strip())
 
-# ======================
-# 法人格スペース処理
-# ======================
+# =============== 会社名整形 ===============
 
 CORP_PREFIXES = ["株式会社", "有限会社", "合同会社",
                  "一般社団法人", "一般財団法人",
@@ -62,62 +54,45 @@ def normalize_company_name(name):
             return p + "　" + rest
     return name
 
-# ======================
-# 住所正規化
-# ======================
+# =============== 住所処理 ===============
 
-BUILDING_KEYWORDS = [
-    "ビル","マンション","ハイツ","アパート","コーポ",
-    "タワー","ヒルズ","荘","レジデンス","ハウス","テラス","メゾン"
-]
+BUILDING_KEYWORDS = ["ビル","マンション","ハイツ","アパート","コーポ","タワー","ヒルズ","荘","レジデンス","ハウス","テラス","メゾン"]
 
 def normalize_address(addr):
-    """丁目・番・号をハイフン化／ビル名抽出"""
     if not addr: return "",""
-    s = addr.strip()
-    s = to_zenkaku(s)
+    s = to_zenkaku(addr.strip())
     s = re.sub(r"[‐-–—−-]", "－", s)
     s = re.sub(r"([０-９]+)丁目", r"\1－", s)
     s = re.sub(r"([０-９]+)番地?", r"\1－", s)
     s = re.sub(r"([０-９]+)号(室)?", r"\1", s)
     s = re.sub(r"－{2,}", "－", s)
 
-    # ビル・部屋番号抽出
     m = re.search(rf"({'|'.join(BUILDING_KEYWORDS)})([　 ]*[０-９]+)", s)
     if m:
         base = s[:m.start()].rstrip()
         bname = m.group(1)
         num = m.group(2).strip()
         return base, f"　{bname}　＃{num}"
-    # 末尾数字3桁以上は地番とみなして残す
-    if re.search(r"[０-９]{3,}$", s): return s,""
-    # 末尾2〜3桁なら部屋番号として抽出
     m2 = re.search(r"(.+?)－([０-９]{1,3})$", s)
     if m2:
         return m2.group(1), f"　＃{m2.group(2)}"
-    return s,""
+    return s, ""
 
-# ======================
-# CSV 読み込み
-# ======================
+# =============== CSV読み込み ===============
 
 def read_csv(file_bytes):
-    for enc in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+    for enc in ("utf-8-sig","utf-8","cp932","shift_jis"):
         try:
             f = io.StringIO(file_bytes.decode(enc))
             reader = csv.DictReader(f)
-            rows = [{(k or "").strip(): (v or "").strip() for k,v in row.items()} for row in reader]
-            return rows
+            return [{(k or "").strip(): (v or "").strip() for k,v in row.items()} for row in reader]
         except Exception:
             continue
     raise ValueError("CSV読み込みに失敗しました")
 
-# ======================
-# データ変換ロジック
-# ======================
+# =============== ラベル分類 ===============
 
 def classify_label(label):
-    """ラベル文字列をwork/home/other分類に"""
     if not label: return "other"
     l = label.lower()
     if any(w in l for w in ["work","mobile","勤務先","会社","職場"]):
@@ -126,11 +101,11 @@ def classify_label(label):
         return "home"
     return "other"
 
+# =============== メイン変換ロジック ===============
+
 def build_record(row):
-    """Google1件を宛名職人形式に変換"""
     get = lambda k: row.get(k,"").strip()
 
-    # 基本情報
     last, first = get("Last Name"), get("First Name")
     last_k, first_k = get("Phonetic Last Name"), get("Phonetic First Name")
 
@@ -150,8 +125,7 @@ def build_record(row):
         for variant in [f"E-mail {n} - Label", f"E-mail {n} - Type"]:
             if variant in row:
                 label = get(variant)
-                valkey = f"E-mail {n} - Value"
-                val = get(valkey)
+                val = get(f"E-mail {n} - Value")
                 if val:
                     grp = classify_label(label)
                     emails[grp].append(normalize_half(val))
@@ -162,8 +136,7 @@ def build_record(row):
         for variant in [f"Phone {n} - Label", f"Phone {n} - Type"]:
             if variant in row:
                 label = get(variant)
-                valkey = f"Phone {n} - Value"
-                val = get(valkey)
+                val = get(f"Phone {n} - Value")
                 if val:
                     grp = classify_label(label)
                     phones[grp].append(normalize_half(val))
@@ -182,24 +155,24 @@ def build_record(row):
             addrs[typ]["postal"] = normalize_half(postal)
             addrs[typ]["line"] = f"{region}{city}{street}"
 
-    # Relation（メモ）
+    # Relation → メモ
     memos = {}
     for n in range(1,10):
         label = get(f"Relation {n} - Label")
         val = get(f"Relation {n} - Value")
         if "メモ" in label:
             idx = re.sub(r"[^0-9]", "", label)
-            if not idx: continue
-            memos[f"メモ{idx}"] = to_zenkaku(val)
+            if idx:
+                memos[f"メモ{idx}"] = to_zenkaku(val)
 
-    # 住所正規化
+    # 住所整形
     def pack_addr(d):
-        base, bld = normalize_address(d["line"])
+        base,bld = normalize_address(d["line"])
         return to_zenkaku(base), to_zenkaku(bld), d["postal"]
 
-    w_base, w_bld, w_post = pack_addr(addrs["work"])
-    h_base, h_bld, h_post = pack_addr(addrs["home"])
-    o_base, o_bld, o_post = pack_addr(addrs["other"])
+    w_base,w_bld,w_post = pack_addr(addrs["work"])
+    h_base,h_bld,h_post = pack_addr(addrs["home"])
+    o_base,o_bld,o_post = pack_addr(addrs["other"])
 
     def join_vals(lst): return ";".join([v for v in lst if v])
 
@@ -210,7 +183,10 @@ def build_record(row):
         "名かな": to_zenkaku(first_k),
         "姓名": to_zenkaku(sei_mei),
         "姓名かな": to_zenkaku(sei_mei_kana),
+        "敬称": "様",
+        "宛先": "会社",
         "ニックネーム": to_zenkaku(nickname),
+        "会社名かな": "",  # ★ 空欄でOK
         "会社名": to_zenkaku(org),
         "部署名1": to_zenkaku(dept),
         "役職名": to_zenkaku(title),
@@ -233,15 +209,12 @@ def build_record(row):
         "誕生日": to_zenkaku(birthday)
     }
 
-    # メモを追加
     for i in range(1,6):
         row_out[f"メモ{i}"] = memos.get(f"メモ{i}","")
 
     return row_out
 
-# ======================
-# Flaskルート
-# ======================
+# =============== Flaskルート ===============
 
 @app.route("/")
 def index():

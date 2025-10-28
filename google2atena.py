@@ -1,4 +1,4 @@
-# google2atena.py — v3.9.10 full-format no-pandas（統合・安定）
+# google2atena.py — v3.9.10a full-format no-pandas（統合・安定・即修正）
 from flask import Flask, request, render_template_string, send_file
 import csv
 import io
@@ -9,8 +9,8 @@ app = Flask(__name__)
 
 HTML = """
 <!doctype html>
-<title>Google連絡先CSV → 宛名職人CSV 変換（v3.9.10 full-format no-pandas）</title>
-<h2>Google連絡先CSV → 宛名職人CSV 変換（v3.9.10 full-format no-pandas）</h2>
+<title>Google連絡先CSV → 宛名職人CSV 変換（v3.9.10a full-format no-pandas）</title>
+<h2>Google連絡先CSV → 宛名職人CSV 変換（v3.9.10a full-format no-pandas）</h2>
 <form method=post enctype=multipart/form-data>
   <p><input type=file name=file required>
      <input type=submit value="変換開始">
@@ -49,7 +49,6 @@ def hankaku_ascii(s: str) -> str:
     """全角英数字を半角ASCIIへ（会社名かなの前処理用）。"""
     if not s:
         return ""
-    # NFKCで正規化→ASCII英数記号は半角化
     return unicodedata.normalize("NFKC", s)
 
 def hira_to_kata(s: str) -> str:
@@ -68,9 +67,10 @@ def hira_to_kata(s: str) -> str:
 # ========= 電話番号 =========
 
 MOBILE_PREFIX = {"070","080","090"}
-AREA_PREFIXES = {
-    # 2桁特例
-    "03":2, "06":2,
+
+# ★ここを修正：明示的に set にする（辞書と混在させない）
+AREA_PREFIXES = set([
+    # 2桁特例（03/06 は別処理）
     # 3桁主要（抜粋・拡張可）
     "011","015","017","018","019","022","023","024","025","026","027","028","029",
     "042","043","044","045","046","047","048","049",
@@ -78,7 +78,7 @@ AREA_PREFIXES = {
     "072","073","075","076","077","078","079",
     "082","083","084","086","087","088","089",
     "092","093","095","096","097","098",
-}
+])
 
 def normalize_phone(raw):
     if not raw:
@@ -98,13 +98,12 @@ def normalize_phone(raw):
         return f"{num[:2]}-{num[2:6]}-{num[6:]}"
     # 既知の3桁市外局番（10桁）
     if len(num) == 10:
-        # 最長一致
         if num[:3] in AREA_PREFIXES:
             return f"{num[:3]}-{num[3:6]}-{num[6:]}"
     # 11桁の固定電話（稀）→ 3-4-4
     if len(num) == 11 and num.startswith("0"):
         return f"{num[:3]}-{num[3:7]}-{num[7:]}"
-    # フォールバック 3-3-4 / 4-3-4
+    # フォールバック 3-3-4
     if len(num) == 10:
         return f"{num[:3]}-{num[3:6]}-{num[6:]}"
     return num
@@ -123,26 +122,23 @@ def split_address_fields(row: dict):
     ext = (row.get("Address 1 - Extended Address", "") or "").strip()
     formatted = (row.get("Address 1 - Formatted", "") or "").strip()
 
-    # Street未入力なら、Formattedの1行目をStreetとして拾う
     if not street and formatted:
         lines = [p.strip() for p in re.split(r"[\r\n]+", formatted) if p.strip()]
         if lines:
             street = lines[0]
 
-    # Street から通り/建物を分離（空白で前半=通り、後半=建物等）
+     # Street から通り/建物を分離（空白で前半=通り、後半=建物等）
     bld = ""
     if street:
-        # 半角/全角スペースどちらでも分割
         parts = re.split(r"[ 　]+", street)
         if len(parts) >= 2:
             street_core = parts[0]
-            bld = "　".join(parts[1:])  # 建物名等
+            bld = "　".join(parts[1:])
         else:
             street_core = street
     else:
         street_core = ""
 
-    # Extendedを建物側に連結
     if ext:
         bld = (bld + ("　" if bld else "") + ext).strip()
 
@@ -150,7 +146,6 @@ def split_address_fields(row: dict):
     addr2 = bld
     addr3 = ""
 
-    # 全角化（郵便番号は別管理のためここでは触らない）
     addr1 = zenkaku(addr1)
     addr2 = zenkaku(addr2)
 
@@ -203,12 +198,10 @@ ROMA2KATA = {
     "X":"エックス","Y":"ワイ","Z":"ゼット"
 }
 
-# 例外辞書（完全一致）
 COMPANY_EXCEPT = {
     "札幌厚生病院":"サッポロコウセイビョウイン",
     "湘南東部総合病院":"ショウナントウブソウゴウビョウイン",
     "東京慈恵会医科大学":"トウキョウジケイカイイカダイガク",
-    # 必要に応じて追加してください
 }
 
 LEGAL_FORMS = r"(株式会社|有限会社|合同会社|社団法人|財団法人|医療法人|学校法人)"
@@ -217,22 +210,14 @@ def company_kana(name: str) -> str:
     if not name:
         return ""
     s = str(name).strip()
+    s = re.sub(LEGAL_FORMS, "", s).strip()
 
-    # 法人格を削除（前後の空白も除去）
-    s = re.sub(LEGAL_FORMS, "", s)
-    s = s.strip()
-
-    # 例外完全一致
     if s in COMPANY_EXCEPT:
         return COMPANY_EXCEPT[s]
 
-    # 全角英字→半角英字へ（ＤＹ 等の対応）
-    s_ascii = hankaku_ascii(s)
+    s_ascii = hankaku_ascii(s)      # ＤＹ → DY
+    s_ascii = hira_to_kata(s_ascii) # ひら→カナ
 
-    # ひらがな→カタカナへ
-    s_ascii = hira_to_kata(s_ascii)
-
-    # 文字ごとに英字は読み上げカタカナ化、それ以外はそのまま
     out = []
     for ch in s_ascii:
         if re.match(r"[A-Za-z]", ch):
@@ -266,13 +251,10 @@ def convert_row(r: dict) -> dict:
     title = r.get("Organization Title","") or ""
     birthday = r.get("Birthday","") or ""
 
-    # 郵便番号（半角維持）
     zip_code = (r.get("Address 1 - Postal Code","") or "").strip()
 
-    # 住所分割（住所1/2は全角化済みで返る）
     addr1, addr2, addr3 = split_address_fields(r)
 
-    # 電話
     phones = []
     for i in range(1,6):
         v = r.get(f"Phone {i} - Value","")
@@ -280,7 +262,6 @@ def convert_row(r: dict) -> dict:
             p = normalize_phone(v)
             if p:
                 phones.append(p)
-    # 重複排除・順序維持
     seen = set()
     uniq = []
     for p in phones:
@@ -288,7 +269,6 @@ def convert_row(r: dict) -> dict:
             uniq.append(p); seen.add(p)
     phone_str = ";".join(uniq)
 
-    # メール
     emails = []
     for i in range(1,6):
         v = r.get(f"E-mail {i} - Value","")
@@ -296,7 +276,6 @@ def convert_row(r: dict) -> dict:
             emails.append(v.strip())
     email_str = ";".join(emails)
 
-    # メモ・Notes
     memos, note = collect_memo_and_notes(r)
 
     row = {h:"" for h in HEADER}
@@ -322,7 +301,6 @@ def convert_row(r: dict) -> dict:
         "会社名かな": company_kana(org),
         "会社名": org,
 
-        # 部署・役職は最終的に全角
         "部署名1": zenkaku(dept),
         "部署名2": "",
         "役職名": zenkaku(title),

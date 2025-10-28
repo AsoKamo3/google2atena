@@ -1,13 +1,13 @@
-# google2atena_v3_4.py
+# google2atena_v3_5.py
 # Google連絡先CSV → 宛名職人CSV 変換
-# 会社名かな(法人格除外) + 宛先固定 + 住所整形 + メモ復活
+# v3.5: 建物名抽出強化版 + 会社名かな自動生成 + 宛先固定 + メモ保持
 
 import io, csv, os, re
-from flask import Flask, request, send_file, abort
+from flask import Flask, request, send_file
 
 app = Flask(__name__)
 
-# ====== 全角・半角変換 ======
+# ====== 文字変換 ======
 FULLWIDTH_OFFSET = ord("！") - ord("!")
 
 def to_zenkaku(s):
@@ -18,8 +18,11 @@ def to_hankaku(s):
     if not isinstance(s, str): return ""
     return "".join(chr(ord(ch)-FULLWIDTH_OFFSET) if 65281 <= ord(ch) <= 65374 else " " if ch=="　" else ch for ch in s)
 
-# ====== 法人格除外リスト ======
-CORP_PREFIXES = ["株式会社","有限会社","合同会社","一般社団法人","一般財団法人","公益社団法人","公益財団法人","社団法人","財団法人"]
+# ====== 法人格 ======
+CORP_PREFIXES = [
+    "株式会社","有限会社","合同会社","一般社団法人","一般財団法人",
+    "公益社団法人","公益財団法人","社団法人","財団法人"
+]
 
 # ====== 会社名かな生成 ======
 def to_katakana(text):
@@ -33,7 +36,6 @@ def to_katakana(text):
     return text.translate(hira_to_kata)
 
 def generate_company_kana(name):
-    """法人格を除いた本体のみカタカナ変換"""
     name = name.strip()
     if not name:
         return ""
@@ -43,7 +45,6 @@ def generate_company_kana(name):
             break
     return to_zenkaku(to_katakana(name))
 
-# ====== 会社名整形 ======
 def normalize_company_name(name):
     if not name: return ""
     for p in CORP_PREFIXES:
@@ -81,11 +82,10 @@ def normalize_emails(val):
             out.append(p)
     return out
 
-# ====== 住所分割 ======
-BUILDING_KEYWORDS = ["ビル","マンション","ハイツ","アパート","コーポ","タワー","ヒルズ","荘","レジデンス","ハウス","テラス","メゾン","棟","号館","プレイス","キャッスル","プラザ","センター","タウン","コート","パレス","ガーデン","ヒル","ビュー","スクエア"]
-
+# ====== 住所分割（v3.5改良） ======
 def normalize_address(addr):
-    if not addr: return "",""
+    if not addr:
+        return "", ""
     s = to_zenkaku(addr.strip())
     s = re.sub(r"[‐–—−-]", "－", s)
     s = re.sub(r"([０-９]+)丁目", r"\1－", s)
@@ -93,30 +93,34 @@ def normalize_address(addr):
     s = re.sub(r"([０-９]+)号(室)?", r"\1", s)
     s = re.sub(r"－{2,}", "－", s)
 
-    # 空白で建物名を判別
-    spaces = [m.start() for m in re.finditer(r"[ 　]+", s)]
-    if spaces:
-        for sp in spaces:
-            left = s[:sp].rstrip()
-            right = s[sp:].strip()
-            if any(k in right for k in BUILDING_KEYWORDS):
-                return left, right
+    building_keywords = [
+        "＃", "号室", "階", "Ｆ", "ビル", "タワー", "マンション", "ハイツ", "アパート",
+        "コーポ","レジデンス","ヒルズ","荘","テラス","メゾン","棟","館","校","寮",
+        "センター","病院","大学","小学校","中学校","高校","ホール","ホテル","工場",
+        "倉庫","ショップ","百貨店","ＳＱＵＡＲＥ","ＯＦＦＩＣＥ","ＢＵＩＬＤＩＮＧ",
+        "ＳＴＵＤＩＯ","ＳＨＯＰ","ＰＬＡＣＥ","内"
+    ]
 
-    for kw in BUILDING_KEYWORDS:
-        m = re.search(re.escape(kw), s)
-        if m:
-            pos = m.start()
-            msp = list(re.finditer(r"[ 　]+", s[:pos]))
-            if msp:
-                sp = msp[-1].start()
-                left = s[:sp].rstrip()
-                right = s[sp:].strip()
-                return left, right
-            else:
-                return s[:pos].rstrip(), s[pos:].strip()
+    # 建物名を含む後半を抽出
+    for kw in building_keywords:
+        pos = s.rfind(kw)
+        if pos != -1 and pos > 10:
+            left = s[:pos].rstrip("　 ")
+            right = s[pos:].strip("　 ")
+            if right and not right.startswith("　"):
+                right = "　" + right
+            return left, right
+
+    # キーワードがない場合は番地で分割
+    m = re.match(r"^(.+[０-９]+[－丁目番地号−ー].*?)([　 ]+.+)?$", s)
+    if m:
+        left = m.group(1).strip("　 ")
+        right = (m.group(2) or "").strip("　 ")
+        return left, right
+
     return s, ""
 
-# ====== CSV読み込み ======
+# ====== CSVユーティリティ ======
 def read_csv(file_bytes):
     for enc in ("utf-8-sig","utf-8","cp932","shift_jis"):
         try:
@@ -132,7 +136,7 @@ def classify_label(label):
     if "home" in l or "自宅" in l: return "home"
     return "other"
 
-# ====== 1件変換 ======
+# ====== レコード変換 ======
 def build_record(row):
     get = lambda k: (row.get(k,"") or "").strip()
     last, first = get("Last Name"), get("First Name")
@@ -145,7 +149,6 @@ def build_record(row):
     dept, title = get("Organization Department"), get("Organization Title")
     nickname, notes, birthday = get("Nickname"), get("Notes"), get("Birthday")
 
-    # メール・電話
     emails, phones = {"work":[],"home":[],"other":[]}, {"work":[],"home":[],"other":[]}
     for n in range(1,10):
         label = get(f"E-mail {n} - Label"); vals = normalize_emails(get(f"E-mail {n} - Value"))
@@ -153,7 +156,6 @@ def build_record(row):
         label = get(f"Phone {n} - Label"); vals = normalize_phones(get(f"Phone {n} - Value"))
         if vals: phones[classify_label(label)].extend(vals)
 
-    # 住所
     addrs = {"work":{"postal":"","line":""},"home":{"postal":"","line":""},"other":{"postal":"","line":""}}
     for n in range(1,10):
         typ = classify_label(get(f"Address {n} - Label"))
@@ -162,7 +164,6 @@ def build_record(row):
             addrs[typ]["postal"] = to_hankaku(postal)
             addrs[typ]["line"]   = f"{region}{city}{street}"
 
-    # メモ
     memos = {}
     for n in range(1,10):
         label, val = get(f"Relation {n} - Label"), get(f"Relation {n} - Value")
@@ -171,7 +172,6 @@ def build_record(row):
             if idx.isdigit() and 1 <= int(idx) <= 5:
                 memos[f"メモ{idx}"] = to_zenkaku(val)
 
-    # 分割
     def pack_addr(d):
         base, bld = normalize_address(d["line"])
         return to_zenkaku(base), to_zenkaku(bld), d["postal"]
@@ -179,10 +179,8 @@ def build_record(row):
     w_base,w_bld,w_post = pack_addr(addrs["work"])
     h_base,h_bld,h_post = pack_addr(addrs["home"])
     o_base,o_bld,o_post = pack_addr(addrs["other"])
-
     join = lambda v:";".join([x for x in v if x])
 
-    # 出力
     return {
         "姓":to_zenkaku(last),"名":to_zenkaku(first),
         "姓かな":to_zenkaku(last_k),"名かな":to_zenkaku(first_k),
@@ -211,7 +209,7 @@ def build_record(row):
 @app.route("/")
 def index():
     return """
-    <h2>Google → 宛名職人 変換ツール v3.4</h2>
+    <h2>Google → 宛名職人 変換ツール v3.5</h2>
     <form method="post" action="/convert" enctype="multipart/form-data">
       <input type="file" name="file" accept=".csv" required>
       <button type="submit">変換開始</button>

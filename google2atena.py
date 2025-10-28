@@ -1,46 +1,57 @@
 import csv, io, re, unicodedata
-from flask import Flask, request, send_file, render_template, jsonify
+from flask import Flask, request, send_file, jsonify
 from datetime import datetime
 
-VERSION = "v3.8 fix 完全版"
+VERSION = "v3.8.2 full-integrated（電話半角版）"
 
 app = Flask(__name__)
 
-# ========== Utility ==========
+# ========= Utility functions =========
 def to_zenkaku(s):
-    if not s: return ""
-    table = str.maketrans({**{chr(i): chr(i+0xFEE0) for i in range(0x21,0x7F)}, " ": "　"})
+    """ASCII文字・空白を全角化"""
+    if not s:
+        return ""
+    table = str.maketrans({**{chr(i): chr(i + 0xFEE0) for i in range(0x21, 0x7F)}, " ": "　"})
     return s.translate(table)
 
 def hira_to_kata(s):
+    """ひらがな→カタカナ"""
     return re.sub(r"[ぁ-ん]", lambda m: chr(ord(m.group(0)) + 0x60), s or "")
 
 def norm_key(s):
-    if not s: return ""
+    """列名を正規化（全角→半角、小文字化、空白・記号除去）"""
+    if not s:
+        return ""
     s = unicodedata.normalize("NFKC", s).lower()
     s = re.sub(r"[ \u3000\-_/・.]+", "", s)
     return s
 
 def company_name_kana(name):
-    if not name: return ""
+    """会社名かな（法人格を除外してカタカナ化）"""
+    if not name:
+        return ""
     name = re.sub(r"(株式会社|有限会社|合同会社|一般社団法人|一般財団法人|学校法人|医療法人|社会福祉法人)", "", name)
     name = to_zenkaku(name.strip())
     return hira_to_kata(name)
 
 def normalize_address(addr):
-    if not addr: return "", ""
+    """住所をスペースで前後分割（v3.6-simplified方式）"""
+    if not addr:
+        return "", ""
     s = addr.strip()
     s = to_zenkaku(s)
     parts = re.split(r"[ 　]+", s, 1)
     return (parts[0], parts[1]) if len(parts) > 1 else (s, "")
 
 def pick(row, *keys):
+    """候補キーから最初に見つかった非空値を返す"""
     for k in keys:
         if k in row and row[k].strip():
             return row[k].strip()
     return ""
 
 def detect_reader(raw):
+    """CSV/TSV自動判別"""
     head = "\n".join(raw.splitlines()[:2])
     try:
         dialect = csv.Sniffer().sniff(head, delimiters=[",", "\t"])
@@ -49,27 +60,61 @@ def detect_reader(raw):
         delim = "\t" if "\t" in head else ","
     return csv.DictReader(io.StringIO(raw), delimiter=delim)
 
-# ========== Flask ==========
+# ========= v3.3 仕様の電話・メール整形 =========
+def combine_phones(row):
+    """v3.3仕様: ラベル優先・無効除外・重複排除、半角出力"""
+    phones = []
+    for i in range(1, 6):
+        label = row.get(f"phone{i}label", "").lower()
+        val = row.get(f"phone{i}value", "").strip()
+        if not val:
+            continue
+        if re.fullmatch(r"0+", val):  # 無効値除外
+            continue
+        val = unicodedata.normalize("NFKC", val)
+        val = re.sub(r"[ー−‐－]", "-", val)
+        val = re.sub(r"\s+", "", val)
+        if val not in phones:
+            phones.append(val)
+    return ";".join(phones)
+
+def combine_emails(row):
+    """v3.3仕様: Work>Home>Other 優先、重複排除"""
+    emails = []
+    for i in range(1, 6):
+        label = row.get(f"email{i}label", "").lower()
+        val = row.get(f"email{i}value", "").strip()
+        if not val:
+            continue
+        if label in ["work", "business"]:
+            emails.insert(0, val)
+        elif label in ["home"]:
+            emails.append(val)
+        else:
+            emails.append(val)
+    seen, uniq = set(), []
+    for e in emails:
+        if e not in seen:
+            seen.add(e)
+            uniq.append(e)
+    return ";".join(uniq)
+
+# ========= Flask main =========
 @app.route("/")
 def index():
-    # 起動時のタイトル画面
-    html = f"""
+    return f"""
     <html>
-        <head><meta charset="utf-8"><title>Google連絡先CSV → 宛名職人CSV 変換 ({VERSION})</title></head>
-        <body style="font-family: sans-serif; margin: 40px;">
-            <h2>Google連絡先CSV → 宛名職人CSV 変換（{VERSION}）</h2>
-            <p>Google 連絡先のエクスポートファイル（CSV または TSV）を選択してください。</p>
-            <form action="/convert" method="post" enctype="multipart/form-data">
-                <input type="file" name="file" accept=".csv,.tsv" required>
-                <br><br>
-                <input type="submit" value="変換開始">
-            </form>
-            <p style="margin-top:20px; color:#555;">変換後のファイルは UTF-8（BOM付）の TSV形式でダウンロードされます。</p>
-        </body>
+      <head><meta charset="utf-8"><title>Google連絡先CSV → 宛名職人CSV変換 ({VERSION})</title></head>
+      <body style="font-family:sans-serif; margin:40px;">
+        <h2>Google連絡先CSV → 宛名職人CSV変換（{VERSION}）</h2>
+        <form action="/convert" method="post" enctype="multipart/form-data">
+          <input type="file" name="file" accept=".csv,.tsv" required>
+          <br><br><input type="submit" value="変換開始">
+        </form>
+        <p style="color:#555;margin-top:20px;">変換後ファイルはUTF-8（BOM付）TSV形式でダウンロードされます。</p>
+      </body>
     </html>
     """
-    return html
-
 
 @app.route("/convert", methods=["POST"])
 def convert():
@@ -121,12 +166,8 @@ def convert():
         zip_code = pick(row, "address1postalcode", "郵便番号")
         addr1, addr2 = normalize_address(street)
 
-        phone_all = ";".join(filter(None, [
-            pick(row, "phone1value"), pick(row, "phone2value"), pick(row, "phone3value")
-        ]))
-        email_company = ";".join(filter(None, [
-            pick(row, "email1value"), pick(row, "email2value")
-        ]))
+        phone_all = combine_phones(row)
+        email_company = combine_emails(row)
         email_home = pick(row, "email3value")
 
         memos = [r.get(f"メモ{i}", "") for i in range(1,6)]
@@ -140,7 +181,7 @@ def convert():
             "様", nickname, "", "会社", "", "", "", "",
             "", "", email_home, "", "",
             to_zenkaku(zip_code), to_zenkaku(addr1), to_zenkaku(addr2), "",
-            to_zenkaku(phone_all), "", email_company, "", "",
+            phone_all, "", email_company, "", "",
             "", "", "", "", "", "", "", "", "",
             org_kana, org, dept, "", title,
             "", "", "", "",
@@ -155,5 +196,5 @@ def convert():
                      download_name=f"converted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tsv")
 
 if __name__ == "__main__":
-    print(f"Google連絡先CSV → 宛名職人CSV 変換（{VERSION}）を起動しました。")
+    print(f"Google連絡先CSV → 宛名職人CSV変換（{VERSION}）を起動しました。")
     app.run(debug=True)

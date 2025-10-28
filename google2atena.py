@@ -10,6 +10,7 @@ app = Flask(__name__)
 # ユーティリティ
 # =========================================================
 def to_zenkaku(s: str) -> str:
+    """半角→全角（英数字＋スペース）"""
     if not s:
         return ""
     table = str.maketrans({
@@ -18,8 +19,9 @@ def to_zenkaku(s: str) -> str:
     })
     return s.translate(table)
 
+
 def normalize_address(addr: str):
-    """最初のスペースで2分割"""
+    """住所を最初のスペース（全角/半角）で二分割"""
     if not addr:
         return "", ""
     s = to_zenkaku(addr.strip())
@@ -28,13 +30,23 @@ def normalize_address(addr: str):
         return parts[0], ""
     return parts[0], parts[1]
 
+
 def company_name_kana(name: str) -> str:
+    """法人格を除外し本文を全角カタカナ化"""
     if not name:
         return ""
     name = re.sub(r"(株式会社|有限会社|合同会社|一般社団法人|一般財団法人|学校法人|医療法人|社会福祉法人)", "", name)
     name = to_zenkaku(name)
     name = re.sub(r"[ぁ-ん]", lambda m: chr(ord(m.group(0)) + 0x60), name)
     return name
+
+
+def get_val(row, *keys):
+    """複数候補キーから最初に存在する値を返す"""
+    for k in keys:
+        if k in row and row[k].strip():
+            return row[k].strip()
+    return ""
 
 
 # =========================================================
@@ -51,13 +63,16 @@ def convert():
     if not file:
         return jsonify({"error": "ファイルが選択されていません"}), 400
 
-    # Google CSV はカンマ区切り
-    input_stream = io.StringIO(file.stream.read().decode('utf-8-sig'))
-    reader = csv.DictReader(input_stream, delimiter=',')
+    raw = file.stream.read().decode('utf-8-sig')
+    delimiter = '\t' if '\t' in raw.split('\n')[0] else ','
+
+    input_stream = io.StringIO(raw)
+    reader = csv.DictReader(input_stream, delimiter=delimiter)
 
     output = io.StringIO()
     writer = csv.writer(output, delimiter='\t', lineterminator='\n')
 
+    # 理想の宛名職人フォーマットに合わせたヘッダー
     headers = [
         "姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな",
         "敬称","ニックネーム","旧姓","宛先","自宅〒","自宅住所1","自宅住所2","自宅住所3",
@@ -73,51 +88,57 @@ def convert():
     writer.writerow(headers)
 
     for row in reader:
-        # 英語と日本語の両ヘッダーに対応
-        sei = row.get("姓") or row.get("Family Name", "")
-        mei = row.get("名") or row.get("Given Name", "")
-        sei_kana = row.get("せい") or row.get("Phonetic Last Name", "")
-        mei_kana = row.get("めい") or row.get("Phonetic First Name", "")
+        sei = get_val(row, "Last Name", "姓")
+        mei = get_val(row, "First Name", "名")
+        sei_kana = get_val(row, "Phonetic Last Name", "せい")
+        mei_kana = get_val(row, "Phonetic First Name", "めい")
+        mid = get_val(row, "Middle Name", "ミドルネーム")
+        mid_kana = get_val(row, "Phonetic Middle Name", "みどるねーむ")
+
         full = f"{sei}　{mei}".strip()
         full_kana = f"{sei_kana}　{mei_kana}".strip()
 
-        nickname = row.get("ニックネーム") or row.get("Nickname", "")
-        company = row.get("株式会社社名") or row.get("Organization Name", "")
-        dept = row.get("部署") or row.get("Organization Department", "")
-        title = row.get("肩書き") or row.get("Organization Title", "")
-        birthday = row.get("誕生日") or row.get("Birthday", "")
-        note = row.get("ノート") or row.get("Notes", "")
-
-        memo1 = row.get("メモ1") or row.get("Relation 1 - Value", "")
-        memo2 = row.get("メモ2") or row.get("Relation 2 - Value", "")
-        memo3 = row.get("メモ3") or row.get("Relation 3 - Value", "")
-        memo4 = row.get("メモ4") or row.get("Relation 4 - Value", "")
-        memo5 = row.get("メモ5") or row.get("Relation 5 - Value", "")
-
-        addr = row.get("Address 1 - Street", "")
-        addr1, addr2 = normalize_address(addr)
-
+        company = get_val(row, "Organization Name", "会社名", "株式会社社名")
         company_kana = company_name_kana(company)
+        dept = get_val(row, "Organization Department", "部署")
+        title = get_val(row, "Organization Title", "肩書き")
+        nickname = get_val(row, "Nickname", "ニックネーム")
+        birthday = get_val(row, "Birthday", "誕生日")
+        note = get_val(row, "Notes", "ノート")
 
+        # メモ項目（連番対応）
+        memo1 = get_val(row, "メモ1")
+        memo2 = get_val(row, "メモ2")
+        memo3 = get_val(row, "メモ3")
+        memo4 = get_val(row, "メモ4")
+        memo5 = get_val(row, "メモ5")
+
+        # 住所（Street から分割）
+        addr = get_val(row, "Address 1 - Street")
+        addr1, addr2 = normalize_address(addr)
+        zip_code = get_val(row, "Address 1 - Postal Code")
+
+        # 連絡先
         company_phones = ";".join([
-            row.get("Phone 1 - Value", ""),
-            row.get("Phone 2 - Value", "")
+            get_val(row, "Phone 1 - Value"),
+            get_val(row, "Phone 2 - Value"),
+            get_val(row, "Phone 3 - Value")
         ]).strip(";")
-
         company_emails = ";".join([
-            row.get("E-mail 1 - Value", ""),
-            row.get("E-mail 2 - Value", "")
+            get_val(row, "E-mail 1 - Value"),
+            get_val(row, "E-mail 2 - Value")
         ]).strip(";")
-
-        home_emails = row.get("E-mail 3 - Value", "")
+        home_emails = get_val(row, "E-mail 3 - Value")
 
         writer.writerow([
-            sei, mei, sei_kana, mei_kana, full, full_kana, "", "", "様", nickname, "", "会社",
-            "", "", "", "", "", "", home_emails, "", "",
-            row.get("Address 1 - Postal Code", ""), addr1, addr2, "", company_phones, "", company_emails, "", "",
-            "", "", "", "", "", "", "", "", "", company_kana, company, dept, "", title,
-            "", "", "", "", memo1, memo2, memo3, memo4, memo5, note, "", "", birthday,
-            "選択なし", "選択なし", "", ""
+            sei, mei, sei_kana, mei_kana, full, full_kana, mid, mid_kana,
+            "様", nickname, "", "会社", "", "", "", "",
+            "", "", home_emails, "", "",
+            zip_code, addr1, addr2, "", company_phones, "", company_emails, "", "",
+            "", "", "", "", "", "", "", "", "",
+            company_kana, company, dept, "", title,
+            "", "", "", "", memo1, memo2, memo3, memo4, memo5,
+            note, "", "", birthday, "選択なし", "選択なし", "", ""
         ])
 
     output.seek(0)

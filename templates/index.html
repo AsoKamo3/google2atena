@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Google連絡先CSV → 宛名職人CSV 変換</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif;
+           max-width: 760px; margin: 48px auto; padding: 0 16px; }
+    .card { border: 1px solid #eee; border-radius: 12px; padding: 16px; margin: 16px 0; box-shadow: 0 2px 10px rgba(0,0,0,.04); }
+    button { background: #2d89ef; color: #fff; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; }
+    button:hover { background: #1b5fad; }
+    #status { margin-top: 8px; font-size: 13px; color: #555; min-height: 1.2em; }
+    code { background: #f5f7fb; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>📇 Google連絡先CSV → 宛名職人CSV 変換</h1>
+
+  <div class="card">
+    <input type="file" id="fileInput" accept=".csv" />
+    <button id="runBtn">変換してダウンロード</button>
+    <div id="status"></div>
+  </div>
+
+  <details class="card">
+    <summary>対応仕様（クリックで展開）</summary>
+    <ul>
+      <li>出力は <code>google_converted.csv</code>（UTF-8）</li>
+      <li>列構造はお預かりした <code>result.csv</code> と同一</li>
+      <li>住所は <b>会社/自宅/その他</b>すべて正規化（丁目/番/号→「Ｎ−Ｎ−Ｎ」、建物・部屋番号分離）</li>
+      <li>会社名冒頭の法人格の後に<strong>全角スペース</strong>挿入（例：株式会社　ネコノス）</li>
+      <li>電話・メール・郵便番号→<strong>半角</strong>、その他→<strong>全角</strong></li>
+      <li>複数メール/電話は <code>;</code> で結合</li>
+      <li>ふりがなは空欄時に Phonetic 列から補完</li>
+      <li>Basic認証：環境変数 <code>BASIC_AUTH_USER / BASIC_AUTH_PASS</code> 設定で有効</li>
+    </ul>
+  </details>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>

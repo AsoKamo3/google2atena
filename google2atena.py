@@ -1,5 +1,5 @@
 # google2atena.py
-# v3.9.18 final CSV版（import済 / no-pandas）
+# v3.9.18r (robust CSV版 / import済 / no-pandas)
 
 from flask import Flask, request, render_template, send_file
 import csv
@@ -7,6 +7,7 @@ import io
 import re
 import unicodedata
 from datetime import datetime
+import chardet
 
 # 外部辞書
 from company_dicts import COMPANY_EXCEPT
@@ -17,56 +18,71 @@ from jp_area_codes import AREA_CODES
 app = Flask(__name__)
 
 # ===============================
-# 住所分割（ハイブリッド）
+# ファイル入力部（堅牢化）
+# ===============================
+def load_csv(file):
+    raw = file.stream.read()
+    detect = chardet.detect(raw)
+    encoding = detect["encoding"] or "utf-8-sig"
+
+    sample_text = raw.decode(encoding, errors="ignore")
+    first_line = sample_text.splitlines()[0]
+    delimiter = "\t" if "\t" in first_line else ","
+
+    # csv.DictReader に渡すストリーム生成
+    stream = io.StringIO(sample_text)
+    reader = csv.DictReader(stream, delimiter=delimiter)
+    return reader
+
+def normalize_keys(row):
+    """列名を正規化（全角→半角、スペース除去）"""
+    return {
+        unicodedata.normalize("NFKC", k).replace("－", "-").replace("–", "-").strip(): v
+        for k, v in row.items()
+    }
+
+# ===============================
+# 住所分割
 # ===============================
 def split_building(address):
-    """住所を『住所1』『建物・部屋』に分割"""
     if not address:
         return "", ""
     addr = address.strip().replace("\r", "")
     parts = addr.split(" ", 1)
     if len(parts) == 2:
         return parts[0], parts[1]
-    building_keywords = [
-        "ビル","マンション","ハイツ","コーポ","レジデンス","タワー",
-        "ヒルズ","メゾン","センター","プラザ","アネックス","ガーデン"
-    ]
-    for kw in building_keywords:
-        idx = addr.find(kw)
-        if idx != -1:
-            return addr[:idx + len(kw)], addr[idx + len(kw):].strip()
+    keywords = ["ビル","マンション","ハイツ","コーポ","レジデンス","タワー","ヒルズ","メゾン","センター","プラザ","アネックス","ガーデン"]
+    for kw in keywords:
+        i = addr.find(kw)
+        if i != -1:
+            return addr[:i+len(kw)], addr[i+len(kw):].strip()
     return addr, ""
 
 # ===============================
-# 全角変換
+# 全角化（郵便番号・電話除く）
 # ===============================
 def _zenkaku_text(text):
-    """数字・記号・英字を全角化（電話・郵便番号を除く）"""
     if not text:
         return ""
-    result = ""
+    out = ""
     for c in text:
         if re.match(r"[A-Za-z0-9\-]", c):
-            result += chr(ord(c) + 0xFEE0)
+            out += chr(ord(c) + 0xFEE0)
         else:
-            result += c
-    return result
+            out += c
+    return out
 
 # ===============================
 # 電話番号整形
 # ===============================
 def _normalize_number(num):
     num = unicodedata.normalize("NFKC", str(num))
-    num = re.sub(r"[^\d]", "", num)
-    return num
+    return re.sub(r"[^\d]", "", num)
 
 def _format_phone(num):
     num = _normalize_number(num)
-    if not num.startswith("0"):
-        if len(num) in [9, 10]:
-            num = "0" + num
-    if len(num) < 9:
-        return num
+    if not num.startswith("0") and len(num) >= 9:
+        num = "0" + num
     for code in sorted(AREA_CODES, key=len, reverse=True):
         if num.startswith(code):
             rest = num[len(code):]
@@ -135,16 +151,20 @@ def _company_to_kana(name):
     return kana
 
 # ===============================
-# Flask メインルート
+# Flask メイン
 # ===============================
 @app.route('/', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
         file = request.files['file']
         if not file:
-            return "ファイルをアップロードしてください。"
+            return "⚠️ ファイルをアップロードしてください。"
 
-        reader = csv.DictReader(io.StringIO(file.stream.read().decode('utf-8-sig')))
+        try:
+            reader = load_csv(file)
+        except Exception as e:
+            return f"⚠️ エラーが発生しました。CSVの形式や文字コードをご確認ください。\n{e}"
+
         output = io.StringIO()
         fieldnames = [
             "姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな","敬称",
@@ -158,7 +178,9 @@ def index():
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
 
-        for row in reader:
+        for row_raw in reader:
+            row = normalize_keys(row_raw)
+
             last, first = row.get("Last Name",""), row.get("First Name","")
             last_kana, first_kana = row.get("Phonetic Last Name",""), row.get("Phonetic First Name","")
             full, full_kana = f"{last}　{first}", f"{last_kana}　{first_kana}"
@@ -167,7 +189,6 @@ def index():
             org_kana = _company_to_kana(org)
             birthday = _format_birthday(row.get("Birthday",""))
 
-            # 住所処理
             label = row.get("Address 1 - Label","")
             addr = row.get("Address 1 - Formatted","")
             home_zip = other_zip = work_zip = ""
@@ -190,17 +211,13 @@ def index():
                 else:
                     work_zip, work_a1, work_a2 = zip_code, a1, a2
 
-            # 電話
             phones = _format_phone_numbers(
                 (row.get("Phone 1 - Value","") or "") + ";" + (row.get("Phone 2 - Value","") or "")
             )
-
-            # メール
             emails = _normalize_emails(
                 row.get("E-mail 1 - Value",""), row.get("E-mail 2 - Value",""), row.get("E-mail 3 - Value","")
             )
 
-            # メモ欄
             notes = [""] * 5
             for k,v in row.items():
                 if re.match(r"メモ ?[1-5１-５]|memo ?[1-5１-５]", k, re.IGNORECASE):

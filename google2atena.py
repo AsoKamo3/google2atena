@@ -1,296 +1,151 @@
-# google2atena.py — v3.9.13 full-format no-pandas（辞書分離・安定版）
+# -*- coding: utf-8 -*-
+"""
+google2atena.py v3.9.14
+----------------------------------------
+Googleスプレッドシートなどから抽出した企業情報を整理・整形し、
+宛名帳（CSV/Excel形式）を生成するスクリプト。
 
-from flask import Flask, request, render_template_string, send_file
-import csv, io, re, unicodedata
-from company_dicts import COMPANY_EXCEPT, KANJI_WORD_MAP  # ← 外部辞書読み込み
-
-app = Flask(__name__)
-
-HTML = """
-<!doctype html>
-<title>Google連絡先CSV → 宛名職人CSV 変換（v3.9.13 full-format no-pandas）</title>
-<h2>Google連絡先CSV → 宛名職人CSV 変換（v3.9.13 辞書分離・安定版）</h2>
-<form method=post enctype=multipart/form-data>
-  <p><input type=file name=file required>
-     <input type=submit value="変換開始">
-</form>
+対応機能：
+- 法人格（株式会社など）自動除去
+- 住所と建物の分割
+- 電話番号の正規化（ハイフン整形）
+- 「会社かな」生成（全角カタカナ化、句読点除去）
+- 外部辞書：COMPANY_EXCEPT / KANJI_WORD_MAP 対応
+----------------------------------------
 """
 
-# ========= 共通ユーティリティ =========
+import re
+import unicodedata
+import pandas as pd
+from company_dicts import COMPANY_EXCEPT
+from kanji_word_map import KANJI_WORD_MAP
 
-def zenkaku(s: str) -> str:
-    """数字・英字・記号・スペースを全角へ"""
-    if not s:
-        return ""
-    fw = str.maketrans({
-        " ": "　", "-": "－", "#": "＃", "/": "／", "&": "＆", "(": "（", ")":"）",
-        "0": "０","1": "１","2": "２","3": "３","4": "４",
-        "5": "５","6": "６","7": "７","8": "８","9": "９",
-        "A":"Ａ","B":"Ｂ","C":"Ｃ","D":"Ｄ","E":"Ｅ","F":"Ｆ","G":"Ｇ","H":"Ｈ",
-        "I":"Ｉ","J":"Ｊ","K":"Ｋ","L":"Ｌ","M":"Ｍ","N":"Ｎ","O":"Ｏ","P":"Ｐ",
-        "Q":"Ｑ","R":"Ｒ","S":"Ｓ","T":"Ｔ","U":"Ｕ","V":"Ｖ","W":"Ｗ","X":"Ｘ",
-        "Y":"Ｙ","Z":"Ｚ","a":"ａ","b":"ｂ","c":"ｃ","d":"ｄ","e":"ｅ","f":"ｆ",
-        "g":"ｇ","h":"ｈ","i":"ｉ","j":"ｊ","k":"ｋ","l":"ｌ","m":"ｍ","n":"ｎ",
-        "o":"ｏ","p":"ｐ","q":"ｑ","r":"ｒ","s":"ｓ","t":"ｔ","u":"ｕ","v":"ｖ",
-        "w":"ｗ","x":"ｘ","y":"ｙ","z":"ｚ",
-    })
-    return str(s).translate(fw)
 
-def hankaku_ascii(s: str) -> str:
-    """全角英数字等をNFKC正規化（半角ASCIIへ）"""
-    if not s:
-        return ""
-    return unicodedata.normalize("NFKC", s)
-
-def hira_to_kata(s: str) -> str:
-    """ひらがな→カタカナ"""
-    if not s:
-        return ""
-    out = []
-    for ch in s:
-        c = ord(ch)
-        out.append(chr(c + 0x60) if 0x3041 <= c <= 0x3096 else ch)
-    return "".join(out)
-
-# ========= 電話番号整形 =========
-
-MOBILE_PREFIX = {"070","080","090"}
-AREA_PREFIXES = set([
-    "011","015","017","018","019","022","023","024","025","026","027","028","029",
-    "042","043","044","045","046","047","048","049","052","053","054","055",
-    "056","058","059","072","073","075","076","077","078","079","082","083",
-    "084","086","087","088","089","092","093","095","096","097","098",
-])
-
-def normalize_phone(raw):
-    if not raw:
-        return ""
-    num = re.sub(r"\D", "", str(raw))
-    if not num:
-        return ""
-    if len(num) == 11 and num[:3] in MOBILE_PREFIX:
-        return f"{num[:3]}-{num[3:7]}-{num[7:]}"
-    if len(num) == 10 and num[:2] in {"03","06"}:
-        return f"{num[:2]}-{num[2:6]}-{num[6:]}"
-    if len(num) == 10 and num[:3] in AREA_PREFIXES:
-        return f"{num[:3]}-{num[3:6]}-{num[6:]}"
-    if len(num) == 11:
-        return f"{num[:3]}-{num[3:7]}-{num[7:]}"
-    if len(num) == 10:
-        return f"{num[:3]}-{num[3:6]}-{num[6:]}"
-    return num
-
-# ========= 住所分割 =========
-
-def split_address_fields(row: dict):
-    region = (row.get("Address 1 - Region","") or "").strip()
-    city = (row.get("Address 1 - City","") or "").strip()
-    street = (row.get("Address 1 - Street","") or "").strip()
-    ext = (row.get("Address 1 - Extended Address","") or "").strip()
-    formatted = (row.get("Address 1 - Formatted","") or "").strip()
-
-    if not street and formatted:
-        lines = [p.strip() for p in re.split(r"[\r\n]+", formatted) if p.strip()]
-        if lines:
-            street = lines[0]
-
-    bld = ""
-    if street:
-        parts = re.split(r"[ 　]+", street)
-        if len(parts) >= 2:
-            street_core = parts[0]
-            bld = "　".join(parts[1:])
-        else:
-            street_core = street
-    else:
-        street_core = ""
-
-    if ext:
-        bld = (bld + ("　" if bld else "") + ext).strip()
-
-    addr1 = f"{region}{city}{street_core}".strip()
-    addr2 = bld
-    addr3 = ""
-
-    addr1 = zenkaku(addr1)
-    addr2 = zenkaku(addr2)
-    return addr1, addr2, addr3
-
-# ========= メモ & Notes =========
-
-def normalize_label(s: str) -> str:
-    if not s:
-        return ""
-    table = str.maketrans({
-        "①":"1","②":"2","③":"3","④":"4","⑤":"5",
-        "１":"1","２":"2","３":"3","４":"4","５":"5","　":"", " ":""
-    })
-    s = str(s).translate(table)
-    return s.lower().replace("memo","メモ")
-
-def collect_memo_and_notes(row: dict):
-    memos = {f"メモ{i}": "" for i in range(1,6)}
-    notes = row.get("Notes","") or ""
-    for i in range(1,6):
-        lbl = normalize_label(row.get(f"Relation {i} - Label",""))
-        val = (row.get(f"Relation {i} - Value","") or "").strip()
-        if val and lbl == f"メモ{i}":
-            memos[f"メモ{i}"] = val
-    for k,v in row.items():
-        if not v:
-            continue
-        lbl = normalize_label(k)
-        m = re.fullmatch(r"メモ([1-5])", lbl)
-        if m and not memos[f"メモ{m.group(1)}"]:
-            memos[f"メモ{m.group(1)}"] = str(v).strip()
-    return memos, notes
-
-# ========= 会社名かな変換 =========
-
-ROMA2KATA = {
-    "A":"エー","B":"ビー","C":"シー","D":"ディー","E":"イー","F":"エフ","G":"ジー","H":"エイチ",
-    "I":"アイ","J":"ジェー","K":"ケー","L":"エル","M":"エム","N":"エヌ","O":"オー","P":"ピー",
-    "Q":"キュー","R":"アール","S":"エス","T":"ティー","U":"ユー","V":"ブイ","W":"ダブリュー",
-    "X":"エックス","Y":"ワイ","Z":"ゼット"
-}
-
-LEGAL_FORMS_PATTERN = re.compile(
-    r"\s*(?:"
-    r"(?:株式|有限|合同)?会社|"
-    r"(?:一般|公益)?\s*社団法人|"
-    r"(?:一般|公益)?\s*財団法人|"
-    r"(?:特定非営利活動法人|ＮＰＯ法人|NPO法人)|"
-    r"(?:独立行政法人|地方独立行政法人|国立大学法人)|"
-    r"(?:医療法人|学校法人|社会福祉法人|宗教法人)|"
-    r"公益法人"
-    r")\s*"
-)
-
-PUNC_REMOVE = str.maketrans("", "", "・.，､･,．")
-
-def company_kana(name: str) -> str:
-    if not name:
-        return ""
-    s = str(name).strip()
-    s_norm = hankaku_ascii(s)
-    prev = None
-    while prev != s_norm:
-        prev = s_norm
-        s_norm = re.sub(LEGAL_FORMS_PATTERN, "", s_norm).strip()
-
-    if s_norm in COMPANY_EXCEPT:
-        out = COMPANY_EXCEPT[s_norm]
-    elif s in COMPANY_EXCEPT:
-        out = COMPANY_EXCEPT[s]
-    else:
-        s2 = hira_to_kata(s_norm)
-        buf = []
-        for ch in s2:
-            if "A" <= ch <= "Z":
-                buf.append(ROMA2KATA[ch])
-            elif "a" <= ch <= "z":
-                buf.append(ROMA2KATA[ch.upper()])
-            else:
-                buf.append(ch)
-        s3 = "".join(buf)
-        for kw,kana in KANJI_WORD_MAP:
-            s3 = s3.replace(kw, kana)
-        out = s3
-
-    out = out.translate(PUNC_REMOVE)
-    out = zenkaku(out)
-    out = re.sub(r"　{2,}", "　", out).strip("　")
-    return out
-
-# ========= 出力ヘッダー =========
-
-HEADER = [
-    "姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな","敬称","ニックネーム","旧姓","宛先",
-    "自宅〒","自宅住所1","自宅住所2","自宅住所3","自宅電話","自宅IM ID","自宅E-mail","自宅URL","自宅Social",
-    "会社〒","会社住所1","会社住所2","会社住所3","会社電話","会社IM ID","会社E-mail","会社URL","会社Social",
-    "その他〒","その他住所1","その他住所2","その他住所3","その他電話","その他IM ID","その他E-mail","その他URL","その他Social",
-    "会社名かな","会社名","部署名1","部署名2","役職名","連名","連名ふりがな","連名敬称","連名誕生日",
-    "メモ1","メモ2","メモ3","メモ4","メモ5",
-    "備考1","備考2","備考3","誕生日","性別","血液型","趣味","性格"
+# ----------------------------------------
+# 共通設定
+# ----------------------------------------
+CORP_TERMS = [
+    "株式会社", "有限会社", "合同会社", "一般社団法人", "一般財団法人",
+    "公益社団法人", "公益財団法人", "特定非営利活動法人",
+    "学校法人", "医療法人", "宗教法人", "社会福祉法人",
+    "公立大学法人", "独立行政法人", "地方独立行政法人"
 ]
 
-# ========= 行変換 =========
+# ----------------------------------------
+# Utility functions
+# ----------------------------------------
 
-def convert_row(r: dict) -> dict:
-    first = r.get("First Name","") or ""
-    last = r.get("Last Name","") or ""
-    first_kana = r.get("Phonetic First Name","") or ""
-    last_kana  = r.get("Phonetic Last Name","") or ""
-    nick = r.get("Nickname","") or ""
-    org = r.get("Organization Name","") or ""
-    dept = r.get("Organization Department","") or ""
-    title = r.get("Organization Title","") or ""
-    birthday = r.get("Birthday","") or ""
-    zip_code = (r.get("Address 1 - Postal Code","") or "").strip()
+def remove_corp_terms(name: str) -> str:
+    """法人格の除去"""
+    if not isinstance(name, str):
+        return ""
+    for term in CORP_TERMS:
+        name = re.sub(term, "", name)
+    return name.strip()
 
-    addr1, addr2, addr3 = split_address_fields(r)
 
-    phones = []
-    for i in range(1,6):
-        v = r.get(f"Phone {i} - Value","")
-        if v:
-            p = normalize_phone(v)
-            if p: phones.append(p)
-    phones = list(dict.fromkeys(phones))
-    phone_str = ";".join(phones)
+def normalize_phone(phone: str) -> str:
+    """電話番号をハイフン区切りに整形"""
+    if not isinstance(phone, str):
+        return ""
+    digits = re.sub(r"\D", "", phone)
+    # 日本の市外局番・携帯番号・フリーダイヤルなどを考慮
+    if digits.startswith("0120"):
+        return f"{digits[:4]}-{digits[4:7]}-{digits[7:]}"
+    elif digits.startswith("080") or digits.startswith("090") or digits.startswith("070"):
+        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    elif len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    elif len(digits) == 11:
+        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    else:
+        return phone
 
-    emails = []
-    for i in range(1,6):
-        v = r.get(f"E-mail {i} - Value","")
-        if v: emails.append(v.strip())
-    email_str = ";".join(emails)
 
-    memos, note = collect_memo_and_notes(r)
+def split_address(address: str):
+    """住所を「住所」と「建物」に分割"""
+    if not isinstance(address, str):
+        return "", ""
+    pattern = r"(.*?)(?:　| )(.*[ビル|マンション|ハイツ|号|室|階|棟].*)"
+    match = re.match(pattern, address)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return address.strip(), ""
 
-    row = {h:"" for h in HEADER}
-    row.update({
-        "姓": last, "名": first,
-        "姓かな": last_kana, "名かな": first_kana,
-        "姓名": f"{last}　{first}".strip(),
-        "姓名かな": f"{last_kana}　{first_kana}".strip(),
-        "敬称": "様", "ニックネーム": nick, "宛先": "会社",
-        "会社〒": zip_code, "会社住所1": addr1, "会社住所2": addr2, "会社住所3": addr3,
-        "会社電話": phone_str, "会社E-mail": email_str,
-        "会社名かな": company_kana(org), "会社名": org,
-        "部署名1": zenkaku(dept), "部署名2": "",
-        "役職名": zenkaku(title),
-        "メモ1": memos["メモ1"], "メモ2": memos["メモ2"],
-        "メモ3": memos["メモ3"], "メモ4": memos["メモ4"], "メモ5": memos["メモ5"],
-        "備考1": note, "誕生日": birthday,
-    })
-    return row
 
-def convert_google_to_atena(text: str):
-    reader = csv.DictReader(io.StringIO(text))
-    return [convert_row(r) for r in reader]
+def to_fullwidth_katakana(text: str) -> str:
+    """すべて全角カタカナに統一"""
+    if not isinstance(text, str):
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[・.,，]", "", text)
+    text = text.translate(str.maketrans({
+        "ﾞ": "゛", "ﾟ": "゜",
+    }))
+    return text
 
-# ========= Flaskルート =========
 
-@app.route("/", methods=["GET","POST"])
-def root():
-    if request.method == "POST":
-        f = request.files.get("file")
-        if not f:
-            return render_template_string(HTML)
-        text = f.read().decode("utf-8", errors="ignore")
-        rows = convert_google_to_atena(text)
+# ----------------------------------------
+# 会社名かな変換
+# ----------------------------------------
 
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=HEADER, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-        data = buf.getvalue().encode("utf-8-sig")
-        return send_file(io.BytesIO(data),
-                         as_attachment=True,
-                         download_name="google_converted.csv",
-                         mimetype="text/csv")
-    return render_template_string(HTML)
+def company_to_kana(name: str) -> str:
+    """会社名からカナ変換を生成"""
+    if not isinstance(name, str) or name.strip() == "":
+        return ""
+
+    # ① 辞書に完全一致している場合
+    if name in COMPANY_EXCEPT:
+        return to_fullwidth_katakana(COMPANY_EXCEPT[name])
+
+    # ② 法人格を除去して検索
+    name_clean = remove_corp_terms(name)
+    if name_clean in COMPANY_EXCEPT:
+        return to_fullwidth_katakana(COMPANY_EXCEPT[name_clean])
+
+    # ③ 後方一致（KANJI_WORD_MAP）
+    for key, val in KANJI_WORD_MAP.items():
+        if name_clean.endswith(key):
+            prefix = name_clean[: -len(key)]
+            kana_prefix = company_to_kana(prefix) if prefix else ""
+            return to_fullwidth_katakana(kana_prefix + val)
+
+    # ④ 自動カタカナ化（英字・数字なども含む）
+    name_kana = re.sub(r"[A-Za-z]", lambda m: chr(ord(m.group(0).upper()) + 0xFEE0), name_clean)
+    return to_fullwidth_katakana(name_kana)
+
+
+# ----------------------------------------
+# DataFrame 変換
+# ----------------------------------------
+
+def convert_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Googleスプレッドシート形式のデータを宛名帳用に整形"""
+    df = df.copy()
+
+    df["会社名"] = df["会社名"].fillna("").astype(str).str.strip()
+    df["会社かな"] = df["会社名"].apply(company_to_kana)
+
+    df["住所"], df["建物"] = zip(*df["住所"].map(split_address))
+    df["電話番号"] = df["電話番号"].apply(normalize_phone)
+
+    return df
+
+
+# ----------------------------------------
+# メイン処理
+# ----------------------------------------
+
+def main(input_path: str, output_path: str):
+    df = pd.read_csv(input_path)
+    df_converted = convert_dataframe(df)
+    df_converted.to_excel(output_path, index=False)
+    print(f"✅ 出力完了: {output_path}")
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    import sys
+    if len(sys.argv) < 3:
+        print("使い方: python google2atena.py input.csv output.xlsx")
+    else:
+        main(sys.argv[1], sys.argv[2])

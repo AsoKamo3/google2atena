@@ -1,135 +1,110 @@
-# google2atena.py
-# v3.9.18r4（住所・電話整形強化版／Render安定構成）
+# google2atena.py  v3.9.18r4p1  (Render最終安定版 / no-pandas)
+# - フェイルセーフ対応（外部辞書が無い場合も動作）
+# - 住所整形：郵便番号=半角ハイフン、住所本文=全角（数字/英字/記号）、建物分離（最初の空白でスプリット）
+# - 電話整形：全国市外局番＋050/0120/0800/0570、;連結、重複排除
+# - メール整形：;連結、重複排除、Home/Work/Otherへ
+# - メモ抽出：Relation「メモ1〜5」、Notes→備考
+# - 会社かな：外部辞書（company_dicts / kanji_word_map / corp_terms）＋英字→カタカナ変換
+# - 出力：CSV (UTF-8-SIG) ダウンロード
 
-import csv
 import io
+import csv
 import re
-import chardet
-from flask import Flask, request, render_template, send_file
+import unicodedata
+from flask import Flask, render_template, request, send_file
 
-# --- 外部辞書読込 ---
+# --- 外部辞書フェイルセーフ読込 ---
 try:
     from company_dicts import COMPANY_EXCEPT
-except Exception:
+except ImportError:
     COMPANY_EXCEPT = {}
-
 try:
-    from kanji_word_map import KANJI_WORD_MAP
-except Exception:
-    KANJI_WORD_MAP = {}
-
+    from kanji_word_map import KANJI_WORD_MAP, EN_TO_KATAKANA
+except ImportError:
+    KANJI_WORD_MAP, EN_TO_KATAKANA = {}, {}
 try:
     from corp_terms import CORP_TERMS
-except Exception:
-    CORP_TERMS = []
+except ImportError:
+    CORP_TERMS = ["株式会社", "有限会社", "合同会社", "Inc.", "Co.", "Ltd."]
 
-try:
-    from jp_area_codes import AREA_CODES
-except Exception:
-    AREA_CODES = {}
+# --- フェイルセーフ辞書補完 ---
+if not COMPANY_EXCEPT:
+    COMPANY_EXCEPT = {"ＮＨＫエデュケーショナル": "エヌエイチケーエデュケーショナル"}
+if not KANJI_WORD_MAP:
+    KANJI_WORD_MAP = {"社": "シャ", "新聞": "シンブン", "放送": "ホウソウ"}
+if not EN_TO_KATAKANA:
+    EN_TO_KATAKANA = {
+        'A': 'エー', 'B': 'ビー', 'C': 'シー', 'D': 'ディー', 'E': 'イー', 'F': 'エフ',
+        'G': 'ジー', 'H': 'エイチ', 'I': 'アイ', 'J': 'ジェー', 'K': 'ケー', 'L': 'エル',
+        'M': 'エム', 'N': 'エヌ', 'O': 'オー', 'P': 'ピー', 'Q': 'キュー', 'R': 'アール',
+        'S': 'エス', 'T': 'ティー', 'U': 'ユー', 'V': 'ブイ', 'W': 'ダブリュー',
+        'X': 'エックス', 'Y': 'ワイ', 'Z': 'ズィー', '&': 'アンド', '+': 'プラス', '-': 'ハイフン'
+    }
 
-# --- Flask 初期化 ---
-app = Flask(__name__)
-
-# --- 文字変換ユーティリティ ---
-def to_zenkaku_address(text):
-    """住所用：英数字・記号を全角に"""
-    if not text:
-        return ""
-    return text.translate(str.maketrans({
-        **{chr(i): chr(i + 0xFEE0) for i in range(0x21, 0x7F)},
-        '-': '－',
-    }))
-
-def to_hankaku_numhyphen(text):
-    """電話・郵便番号用：数字とハイフンを半角に"""
-    if not text:
-        return ""
-    return text.translate(str.maketrans({
-        **{chr(i + 0xFEE0): chr(i) for i in range(0xFF10, 0xFF1A)},
-        'ー': '-',
-        '−': '-',
-        '―': '-',
-        '‐': '-',
-        '－': '-'
-    }))
-
-# --- 電話番号整形 ---
-def normalize_phones(*phones):
-    numbers = []
-    for p in phones:
-        if not p:
-            continue
-        parts = re.split(r"[;:：\s／/]+", p)
-        for n in parts:
-            n = re.sub(r"[^\d]", "", n)
-            if not n:
-                continue
-            # 先頭0補正
-            if re.match(r"^9\d{8,9}$", n):
-                n = "0" + n  # 携帯0抜け補正
-            elif re.match(r"^[1-9]\d{8,9}$", n):
-                n = "0" + n  # 固定電話0抜け補正
-
-            # 市外局番マッチング（ハイフン挿入）
-            n = hyphenate_phone_by_area(n)
-            if n not in numbers:
-                numbers.append(n)
-    return ";".join(numbers)
-
-def hyphenate_phone_by_area(num):
-    """AREA_CODES辞書に基づいて電話番号にハイフンを入れる"""
-    if not num:
-        return ""
-    for prefix in sorted(AREA_CODES.keys(), key=lambda x: -len(x)):
-        if num.startswith(prefix):
-            body_len = AREA_CODES[prefix]
-            return f"{prefix}-{num[len(prefix):len(prefix)+body_len]}-{num[len(prefix)+body_len:]}"
-    # fallback
-    if len(num) == 11:
-        return f"{num[:3]}-{num[3:7]}-{num[7:]}"
-    if len(num) == 10:
-        return f"{num[:2]}-{num[2:6]}-{num[6:]}"
-    return num
+# --- 英字→カタカナ変換 ---
+def alpha_to_katakana(text):
+    return "".join(EN_TO_KATAKANA.get(ch.upper(), ch) for ch in text)
 
 # --- 住所整形 ---
-def split_building(street):
-    """最初に出てくるスペースまたは建物語で分割"""
-    if not street:
-        return "", ""
-    street = street.strip()
-    # ビル・マンション等を基準に分離
-    m = re.search(r"(.+?)(?:(?:　|\s|,|、|,)(.*[ビル|マンション|タワー|荘|ハイツ|ヒルズ|#].*))", street)
-    if m:
-        return m.group(1), m.group(2)
-    # fallback: 最初のスペースで分割
-    parts = re.split(r"[ 　]", street, 1)
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return street, ""
-
-def split_google_address(addr):
-    """Google連絡先形式住所から都道府県、市区町村、番地等を抽出"""
+def normalize_address(addr):
     if not addr:
-        return "", "", "", "", "", "", "", "", "", "", ""
-    lines = [line.strip() for line in addr.split("\n") if line.strip()]
-    street = city = region = postal = country = ""
-    for line in lines:
-        if re.match(r"^\d{3}-\d{4}$", line):
-            postal = to_hankaku_numhyphen(line)
-        elif line in ["日本", "Japan"]:
-            country = "日本"
-        elif re.search(r"(都|道|府|県)$", line):
-            region = line
-        elif re.search(r"(区|市|町|村)", line):
-            city = line
-        else:
-            street = line
-    # 建物分割を street のみ対象に
-    addr2, bldg = split_building(street)
-    return postal, region, city, addr2, bldg, country
+        return "", "", "", ""
+    addr = re.sub(r"\r|\n", " ", addr.strip())
+    addr = unicodedata.normalize("NFKC", addr)
+    zip_match = re.search(r"(\d{3})[-‐–−ー]?(\d{4})", addr)
+    zipcode = f"{zip_match.group(1)}-{zip_match.group(2)}" if zip_match else ""
+    addr = re.sub(r"\d{3}[-‐–−ー]?\d{4}", "", addr)
+    addr = re.sub(r"\s+", " ", addr).strip()
 
-# --- 会社名かな変換 ---
+    # 最初のスペースで建物を分割
+    bldg = ""
+    if " " in addr:
+        main, bldg = addr.split(" ", 1)
+    else:
+        main = addr
+    return zipcode, main, bldg.strip(), ""
+
+# --- 電話番号整形 ---
+JP_AREA_CODES = [
+    "011","015","017","018","019","022","023","024","025","026","027","028","029",
+    "03","04","042","043","044","045","046","047","048","049","052","053","054","055","056","057",
+    "058","059","06","072","073","075","076","077","078","079","082","083","084","085","086","087",
+    "088","089","092","093","094","095","096","097","098","099","0997","09912","0120","0800","050","0570"
+]
+def normalize_phones(values):
+    if not values:
+        return ""
+    phones = []
+    for v in values:
+        v = re.sub(r"\D", "", v)
+        if not v:
+            continue
+        if v.startswith(("81", "+81")):
+            v = re.sub(r"^\+?81", "0", v)
+        for code in JP_AREA_CODES:
+            if v.startswith(code):
+                if len(v) == 11:
+                    v = re.sub(r"(\d{3})(\d{4})(\d{4})", r"\1-\2-\3", v)
+                elif len(v) == 10:
+                    v = re.sub(r"(\d{2,4})(\d{2,4})(\d{4})", r"\1-\2-\3", v)
+                break
+        phones.append(v)
+    return ";".join(sorted(set(phones)))
+
+# --- メール整形 ---
+def normalize_emails(values):
+    if not values:
+        return ""
+    allmails = []
+    for v in values:
+        if not v:
+            continue
+        for part in re.split(r"[,;:：:::／/ ]+", v):
+            if "@" in part:
+                allmails.append(part.strip())
+    return ";".join(sorted(set(allmails)))
+
+# --- 会社名かな生成 ---
 def kana_company_name(org):
     if not org:
         return "", ""
@@ -139,92 +114,84 @@ def kana_company_name(org):
     kana = COMPANY_EXCEPT.get(clean, "")
     if not kana:
         kana = "".join(KANJI_WORD_MAP.get(ch, ch) for ch in clean)
+        kana = alpha_to_katakana(kana)
     return kana, org.strip()
 
-# --- 変換メイン ---
-@app.route("/", methods=["GET"])
+# --- Flaskアプリ ---
+app = Flask(__name__)
+
+@app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/convert", methods=["POST"])
 def convert():
-    if "file" not in request.files:
-        return "⚠️ ファイルが見つかりません。"
-    file = request.files["file"]
-    if file.filename == "":
-        return "⚠️ ファイルを選択してください。"
+    file = request.files.get("file")
+    if not file:
+        return "⚠️ ファイルが選択されていません。", 400
 
-    data = file.read()
-    encoding = chardet.detect(data)["encoding"] or "utf-8"
-    text = data.decode(encoding, errors="ignore")
-    sample = text[:1024]
-    dialect = csv.Sniffer().sniff(sample)
+    # --- 文字コード自動判定 ---
+    import chardet
+    raw = file.read()
+    enc = chardet.detect(raw)["encoding"] or "utf-8"
+    file.seek(0)
+    text = raw.decode(enc, errors="ignore")
+
+    # --- 区切り自動検出 ---
+    sniffer = csv.Sniffer()
+    dialect = sniffer.sniff(text.splitlines()[0])
     reader = csv.DictReader(io.StringIO(text), dialect=dialect)
 
     output = io.StringIO()
-    writer = csv.writer(output, lineterminator="\n")
+    writer = csv.writer(output, quoting=csv.QUOTE_ALL)
 
-    # ヘッダ（既存仕様通り）
-    headers = [
-        "姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな","敬称","ニックネーム",
-        "旧姓","宛先","自宅〒","自宅住所1","自宅住所2","自宅住所3","自宅電話","自宅IM ID","自宅E-mail","自宅URL","自宅Social",
-        "会社〒","会社住所1","会社住所2","会社住所3","会社電話","会社IM ID","会社E-mail","会社URL","会社Social",
-        "その他〒","その他住所1","その他住所2","その他住所3","その他電話","その他IM ID","その他E-mail","その他URL","その他Social",
-        "会社名かな","会社名","部署名1","部署名2","役職名","連名","連名ふりがな","連名敬称","連名誕生日",
-        "メモ1","メモ2","メモ3","メモ4","メモ5","備考1","備考2","備考3","誕生日","性別","血液型","趣味","性格"
-    ]
+    # --- 出力ヘッダ ---
+    headers = ["姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな",
+               "敬称","ニックネーム","旧姓","宛先","自宅〒","自宅住所1","自宅住所2","自宅住所3",
+               "自宅電話","自宅IM ID","自宅E-mail","自宅URL","自宅Social",
+               "会社〒","会社住所1","会社住所2","会社住所3","会社電話","会社IM ID","会社E-mail",
+               "会社URL","会社Social","その他〒","その他住所1","その他住所2","その他住所3",
+               "その他電話","その他IM ID","その他E-mail","その他URL","その他Social",
+               "会社名かな","会社名","部署名1","部署名2","役職名","連名","連名ふりがな","連名敬称",
+               "連名誕生日","メモ1","メモ2","メモ3","メモ4","メモ5","備考1","備考2","備考3",
+               "誕生日","性別","血液型","趣味","性格"]
     writer.writerow(headers)
 
     for row in reader:
-        sei, mei = row.get("Last Name", ""), row.get("First Name", "")
-        sei_kana, mei_kana = row.get("Phonetic Last Name", ""), row.get("Phonetic First Name", "")
-        full = f"{sei}　{mei}".strip()
-        full_kana = f"{sei_kana}　{mei_kana}".strip()
-        org = row.get("Organization Name", "")
-        org_kana, org_full = kana_company_name(org)
+        first = row.get("First Name","").strip()
+        last = row.get("Last Name","").strip()
+        first_k = row.get("Phonetic First Name","").strip()
+        last_k = row.get("Phonetic Last Name","").strip()
+        org = row.get("Organization Name","").strip()
+        dept = row.get("Organization Department","").strip()
+        title = row.get("Organization Title","").strip()
 
-        # 住所
-        a1_label = row.get("Address 1 - Label", "")
-        postal, region, city, addr2, bldg, country = split_google_address(row.get("Address 1 - Formatted", ""))
-        home_postal = other_postal = ""
-        home_addr1 = home_addr2 = home_addr3 = ""
-        other_addr1 = other_addr2 = other_addr3 = ""
-        if a1_label == "Home":
-            home_postal, home_addr1, home_addr2, home_addr3 = postal, region+city+addr2, bldg, country
-        else:
-            other_postal, other_addr1, other_addr2, other_addr3 = postal, region+city+addr2, bldg, country
+        # --- 住所整形 ---
+        addr_zip, addr1, addr2, addr3 = normalize_address(row.get("Address 1 - Formatted",""))
 
-        # 電話
-        phone = normalize_phones(row.get("Phone 1 - Value", ""), row.get("Phone 2 - Value", ""))
+        # --- 電話整形 ---
+        phones = normalize_phones([row.get("Phone 1 - Value",""), row.get("Phone 2 - Value","")])
 
-        # メール
-        emails = [v for k, v in row.items() if "E-mail" in k and v]
-        email_combined = ";".join(emails)
+        # --- メール整形 ---
+        emails = normalize_emails([row.get("E-mail 1 - Value",""),
+                                   row.get("E-mail 2 - Value",""),
+                                   row.get("E-mail 3 - Value","")])
 
-        # メモ
-        notes = [row.get(f"メモ{i}", "") for i in range(1, 6)]
+        kana_org, org_name = kana_company_name(org)
 
+        # --- 出力行 ---
         writer.writerow([
-            sei, mei, sei_kana, mei_kana, full, full_kana, "", "", "様", row.get("Nickname", ""), "",
-            "会社",
-            home_postal, home_addr1, home_addr2, home_addr3,
-            "", "", "", "", "",
-            postal, region+city+addr2, bldg, country,
-            phone, "", email_combined, "", "",
-            other_postal, other_addr1, other_addr2, other_addr3,
-            "", "", "", "", "",
-            org_kana, org_full, row.get("Organization Department", ""), "", row.get("Organization Title", ""),
-            "", "", "", "",
-            *notes,
-            "", "", "", row.get("Birthday", ""), "選択なし", "選択なし", "", ""
+            last, first, last_k, first_k, f"{last}　{first}", f"{last_k}　{first_k}", "", "", "様", "", "",
+            "会社", addr_zip, addr1, addr2, addr3, phones, "", emails, "", "",
+            addr_zip, addr1, addr2, addr3, phones, "", emails, "", "", "", "", "", "", "", "", "", "", "",
+            kana_org, org_name, dept, "", title, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""
         ])
 
     output.seek(0)
     return send_file(io.BytesIO(output.getvalue().encode("utf-8-sig")),
                      mimetype="text/csv",
                      as_attachment=True,
-                     download_name="converted_v3.9.18r4.csv")
+                     download_name="converted.csv")
 
-# --- Render 実行 ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

@@ -1,9 +1,6 @@
-# google2atena.py  v3.9.18r7a  (Render安定版 / no-pandas)
-# - 住所振り分け: Address 1 - Label に応じて Work/Home/Other 各住所カラムへ
-# - 住所分割: Region + City + Street → 全角化 → 最初の空白で分割
-# - 郵便番号: 半角数字＋半角ハイフン
-# - 電話・メール・メモなど他機能は v3.9.18r6 と同じ
-# - 出力: CSV (UTF-8-SIG)
+# google2atena.py  v3.9.18r7b  (Render安定版 / no-pandas)
+# - 電話番号整形強化（050/090/0120/0570/市外局番パターン対応）
+# - 他機能は r7a と同一（住所振り分け、フェイルセーフ、メモ、メール整形など）
 
 import csv
 import io
@@ -11,7 +8,7 @@ import re
 import unicodedata
 from flask import Flask, render_template_string, request, send_file
 
-# ======== 外部辞書のフェイルセーフ読込 ========
+# ======== 外部辞書フェイルセーフ ========
 try:
     from company_dicts import COMPANY_EXCEPT
 except Exception:
@@ -32,10 +29,9 @@ except Exception:
         "宗教法人", "社会福祉法人", "公立大学法人", "独立行政法人", "地方独立行政法人"
     ]
 
-# ======== アプリケーション設定 ========
 app = Flask(__name__)
 
-# ======== 住所関連ユーティリティ ========
+# ======== 住所ユーティリティ ========
 
 def to_zenkaku_for_address(s: str) -> str:
     if not s:
@@ -57,12 +53,12 @@ def format_postal(postal: str) -> str:
         return ""
     digits = re.sub(r'\D', '', postal)
     if len(digits) == 7:
-        return f"{digits[0:3]}-{digits[3:7]}"
+        return f"{digits[:3]}-{digits[3:]}"
     return postal
 
 _SPLIT_RE = re.compile(r'[ \u3000]')
 
-def split_first_space(addr_full: str) -> tuple[str, str]:
+def split_first_space(addr_full: str):
     if not addr_full:
         return ("", "")
     m = _SPLIT_RE.search(addr_full)
@@ -71,14 +67,14 @@ def split_first_space(addr_full: str) -> tuple[str, str]:
     i = m.start()
     return (addr_full[:i], addr_full[i+1:].strip())
 
-def build_addr12(region: str, city: str, street: str) -> tuple[str, str]:
+def build_addr12(region, city, street):
     parts = [p for p in [region, city, street] if p]
     full = "".join(parts)
     full_z = to_zenkaku_for_address(full)
     a1, a2 = split_first_space(full_z)
     return (a1, a2)
 
-def route_address_by_label(row: dict, out: dict) -> None:
+def route_address_by_label(row, out):
     label = (row.get('Address 1 - Label') or "").strip().lower()
     region = row.get('Address 1 - Region') or ""
     city   = row.get('Address 1 - City') or ""
@@ -104,7 +100,16 @@ def route_address_by_label(row: dict, out: dict) -> None:
         out['会社住所2'] = addr2
         out['会社住所3'] = ""
 
-# ======== 電話番号・メール整形 ========
+# ======== 電話番号整形 ========
+
+# 全国市外局番パターン（抜粋・代表）
+CITY_CODES = [
+    '011','015','017','018','019','022','023','024','025','026','027','028','029',
+    '03','04','042','043','044','045','046','047','048','049','052','053','054',
+    '055','056','057','058','059','06','072','073','074','075','076','077','078',
+    '079','082','083','084','085','086','087','088','089','092','093','094','095',
+    '096','097','098','099'
+]
 
 def normalize_phones(phone_values):
     phones = []
@@ -114,33 +119,38 @@ def normalize_phones(phone_values):
         nums = re.sub(r'\D', '', val)
         if not nums:
             continue
-        # 桁数から0補完
         if not nums.startswith('0'):
             nums = '0' + nums
-        # 11桁携帯 or 固定電話パターン
-        if re.match(r'^0\d{9,10}$', nums):
-            if nums.startswith(('070', '080', '090', '050', '0120', '0800', '0570')):
-                # 携帯/VoIP/フリーダイヤル/ナビダイヤル
-                if len(nums) == 11:
-                    val = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
-                elif len(nums) == 10:
-                    val = f"{nums[:4]}-{nums[4:7]}-{nums[7:]}"
-                else:
-                    val = nums
-            else:
-                # 市外局番推定
-                if len(nums) == 10:
-                    val = f"{nums[:2]}-{nums[2:6]}-{nums[6:]}"
-                else:
-                    val = nums
+
+        formatted = nums
+
+        # 携帯・PHS・IP電話・フリーダイヤル等の特殊系
+        if re.match(r'^0(70|80|90)\d{8}$', nums):
+            formatted = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
+        elif re.match(r'^050\d{8}$', nums):  # IP電話
+            formatted = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
+        elif re.match(r'^(0120|0800|0570)\d{6}$', nums):  # 特番
+            formatted = f"{nums[:4]}-{nums[4:7]}-{nums[7:]}"
+        elif len(nums) == 10:  # 固定電話（市外局番判定）
+            for code in sorted(CITY_CODES, key=len, reverse=True):
+                if nums.startswith(code):
+                    remain = nums[len(code):]
+                    if len(remain) == 7:
+                        formatted = f"{code}-{remain[:3]}-{remain[3:]}"
+                    elif len(remain) == 6:
+                        formatted = f"{code}-{remain[:2]}-{remain[2:]}"
+                    break
+        elif len(nums) == 9:  # 旧地方形式
+            formatted = f"{nums[:2]}-{nums[2:5]}-{nums[5:]}"
         else:
-            val = nums
-        phones.append(val)
-    uniq = []
-    for p in phones:
-        if p not in uniq:
-            uniq.append(p)
-    return ";".join(uniq)
+            formatted = nums
+
+        if formatted not in phones:
+            phones.append(formatted)
+
+    return ";".join(phones)
+
+# ======== メール整形 ========
 
 def normalize_emails(email_values):
     emails = []
@@ -166,7 +176,7 @@ def extract_memos(row):
         memos.append(notes)
     return memos
 
-# ======== 会社かな変換 ========
+# ======== 会社名かな変換 ========
 
 def kana_company_name(name):
     if not name:
@@ -215,6 +225,7 @@ def convert():
     reader = csv.DictReader(io.StringIO(text))
     output = io.StringIO()
     writer = csv.writer(output)
+
     header = [
         "姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな","敬称",
         "ニックネーム","旧姓","宛先","自宅〒","自宅住所1","自宅住所2","自宅住所3","自宅電話",

@@ -1,10 +1,8 @@
-# google2atena.py  v3.9.18r5  (Render改善安定版 / no-pandas)
-# - フェイルセーフ対応（外部辞書が無い場合も動作）
-# - 住所整形：Region + City + Street、全角化、最初の空白で建物名分離
-# - 電話整形：桁数判定＋ゼロ補完＋ハイフン挿入、;連結、重複排除
-# - メール整形：;連結、重複排除
-# - 会社かな：外部辞書（company_dicts / kanji_word_map / corp_terms）＋英字→カタカナ変換
-# - 出力：CSV (UTF-8-SIG) ダウンロード対応
+# google2atena.py  v3.9.18r6  (Render最終安定版 / no-pandas)
+# - v3.9.18r5 構造維持
+# - 電話番号整形：携帯・固定の判定改善、0保持
+# - メモ欄抽出：Relation 1–5, Notes対応
+# - フェイルセーフ辞書読込維持
 
 import io
 import csv
@@ -33,11 +31,10 @@ if not KANJI_WORD_MAP:
     KANJI_WORD_MAP = {"社": "シャ", "新聞": "シンブン", "放送": "ホウソウ"}
 if not EN_TO_KATAKANA:
     EN_TO_KATAKANA = {
-        'A': 'エー','B': 'ビー','C': 'シー','D': 'ディー','E': 'イー','F': 'エフ','G': 'ジー',
-        'H': 'エイチ','I': 'アイ','J': 'ジェー','K': 'ケー','L': 'エル','M': 'エム','N': 'エヌ',
-        'O': 'オー','P': 'ピー','Q': 'キュー','R': 'アール','S': 'エス','T': 'ティー','U': 'ユー',
-        'V': 'ブイ','W': 'ダブリュー','X': 'エックス','Y': 'ワイ','Z': 'ズィー','&': 'アンド',
-        '+': 'プラス','-': 'ハイフン'
+        'A':'エー','B':'ビー','C':'シー','D':'ディー','E':'イー','F':'エフ','G':'ジー','H':'エイチ',
+        'I':'アイ','J':'ジェー','K':'ケー','L':'エル','M':'エム','N':'エヌ','O':'オー','P':'ピー',
+        'Q':'キュー','R':'アール','S':'エス','T':'ティー','U':'ユー','V':'ブイ','W':'ダブリュー',
+        'X':'エックス','Y':'ワイ','Z':'ズィー','&':'アンド','+':'プラス','-':'ハイフン'
     }
 
 # --- 英字→カタカナ変換 ---
@@ -46,7 +43,7 @@ def alpha_to_katakana(text):
 
 # --- 半角英数→全角変換 ---
 def to_zenkaku(text):
-    return "".join(chr(ord(c) + 0xFEE0) if "!" <= c <= "~" else c for c in text)
+    return "".join(chr(ord(c)+0xFEE0) if "!" <= c <= "~" else c for c in text)
 
 # --- 住所整形 ---
 def normalize_address(row):
@@ -76,11 +73,17 @@ def normalize_phones(values):
             if not digits:
                 continue
             digits = re.sub(r"^\+?81", "0", digits)  # 国際→国内
-            if len(digits) == 11:
+            # --- 携帯電話 ---
+            if re.match(r"^0[789]0\d{8}$", digits):
                 digits = f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
-            elif len(digits) == 10:
-                digits = f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
-            elif len(digits) == 9:
+            # --- 固定電話 ---
+            elif re.match(r"^0\d{9}$", digits):
+                if digits.startswith(("03","06")):  # 東京・大阪など
+                    digits = f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
+                else:
+                    digits = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+            # --- その他（内線など） ---
+            elif len(digits) >= 7:
                 digits = f"0{digits[:2]}-{digits[2:5]}-{digits[5:]}"
             phones.append(digits)
     return ";".join(sorted(set(phones)))
@@ -161,11 +164,19 @@ def convert():
         emails = normalize_emails([row.get("E-mail 1 - Value",""), row.get("E-mail 2 - Value",""), row.get("E-mail 3 - Value","")])
         kana_org, org_name = kana_company_name(org)
 
+        # メモ・備考抽出
+        memos = []
+        for i in range(1, 6):
+            val = row.get(f"Relation {i} - Value", "").strip()
+            memos.append(val if val else "")
+        notes = row.get("Notes", "").strip()
+        b1, b2, b3 = (notes.split(":::", 2) + ["", "", ""])[:3]
+
         writer.writerow([
             last, first, last_k, first_k, f"{last}　{first}", f"{last_k}　{first_k}", "", "", "様", "", "",
             "会社", addr_zip, addr1, addr2, addr3, phones, "", emails, "", "",
             addr_zip, addr1, addr2, addr3, phones, "", emails, "", "", "", "", "", "", "", "", "", "", "",
-            kana_org, org_name, dept, "", title, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""
+            kana_org, org_name, dept, "", title, "", "", "", "", *memos, b1, b2, b3, "", "", "", "", ""
         ])
 
     output.seek(0)

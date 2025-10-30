@@ -145,17 +145,32 @@ def normalize_emails(*vals):
 
 # ---- 住所 ----------------------------------------------------------------------
 def build_address(line):
-    reg = (line.get('address_1__region') or '').strip()
-    city = (line.get('address_1__city') or '').strip()
-    street = (line.get('address_1__street') or '').strip()
+    # Region / City / Street を順に探索（Work/Home/Other いずれにも対応）
+    reg = get(line,
+        'address_1__region', 'address_home__region', 'address_work__region', 'address_other__region'
+    ).strip()
+    city = get(line,
+        'address_1__city', 'address_home__city', 'address_work__city', 'address_other__city'
+    ).strip()
+    street = get(line,
+        'address_1__street', 'address_home__street', 'address_work__street', 'address_other__street'
+    ).strip()
     body = ' '.join([x for x in [reg, city, street] if x])
+
+    # 全角変換
     zbody = to_zenkaku_except_hyphen(body)
+
+    # 建物分割（最初のスペースで分割）
     addr1, addr2 = zbody, ''
     m = re.search(r'\s+', zbody)
     if m:
         i = m.start()
         addr1, addr2 = zbody[:i], zbody[i:].strip()
-    pc = (line.get('address_1__postal_code') or '').strip()
+
+    # 郵便番号（7桁→3-4形式）
+    pc = get(line,
+        'address_1__postal_code', 'address_home__postal_code', 'address_work__postal_code', 'address_other__postal_code'
+    ).strip()
     pc = only_digits(pc)
     if len(pc) == 7:
         pc = f"{pc[:3]}-{pc[3:]}"

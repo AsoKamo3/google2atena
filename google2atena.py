@@ -1,17 +1,9 @@
-# google2atena.py  v3.9.18r7e  (Render安定版 / no-pandas)
-# - 文字コード自動判定（chardet）
-# - 区切り自動検出（csv.Sniffer）
-# - キー正規化
-# - 住所整形：郵便番号=半角ハイフン、住所本文=全角（数字/英字/記号）、建物分離（先頭スペース/空白でスプリット）
-# - Address 1 - Label に応じて Home / Work / Other に振り分け
-# - 電話整形：全国市外局番プリセット + 050/0120/0800/0570、;連結、重複排除
-# - メール整形：;連結、重複排除、Home/Work/Otherへ
-# - メモ抽出：Relation「メモ1〜5」、Notes→備考
-# - 会社かな：外部辞書（company_dicts / kanji_word_map / corp_terms）があれば使用。無ければ最小デフォルトでフェールセーフ。
-# - 出力：CSV (UTF-8-SIG) ダウンロード
-# - バージョン表記付き出力
+# google2atena.py  v3.9.18r7d+addrfix  (Render安定版 / no-pandas)
+# - v3.9.18r7d をベースに、住所部分のみ修正
+# - Address 1 - Label に基づき Home / Work / Other へ振り分け
+# - 電話・メール・メモ・誕生日などの処理は変更なし
 
-import csv, io, re, sys, os, chardet
+import csv, io, re, sys, os, chardet, unicodedata
 
 # ========== 共通関数 ==========
 
@@ -22,39 +14,40 @@ def norm_key(s):
     return re.sub(r'[^a-z0-9]+', '_', s.strip().lower())
 
 def only_digits(s):
-    return re.sub(r'\D', '', s)
+    return re.sub(r'\D', '', s or '')
 
 def to_zenkaku_except_hyphen(s):
-    import unicodedata
-    result = []
-    for ch in s:
+    out = []
+    for ch in s or '':
         if ch == '-':
-            result.append(ch)
+            out.append(ch)
         else:
-            result.append(unicodedata.normalize('NFKC', ch))
-    return ''.join(result)
+            out.append(unicodedata.normalize('NFKC', ch))
+    return ''.join(out)
 
-def get(d, *keys):
-    for k in keys:
-        if k in d and d[k]:
-            return d[k]
-    return ''
+# ========== jp_area_codes 読み込み（フェイルセーフ） ==========
 
-# ========== 電話番号整形 ==========
+try:
+    from jp_area_codes import AREA_CODES, SPECIAL
+except Exception:
+    from jp_area_codes import AREA_CODES
+    SPECIAL = {"0120", "0800", "0570", "050"}
 
-from jp_area_codes import AREA_CODES, SPECIAL
+# ========== 電話番号整形（r7dそのまま） ==========
 
 def format_phone(num):
     num = only_digits(num)
     if not num:
         return ''
-    if num.startswith('0') is False:
+    if num[0] != '0':
         num = '0' + num
     for code in sorted(AREA_CODES, key=len, reverse=True):
         if num.startswith(code):
             rest = num[len(code):]
             if code in SPECIAL:
-                return f"{code}-{rest[:4]}-{rest[4:]}" if len(rest) > 4 else f"{code}-{rest}"
+                if len(rest) > 4:
+                    return f"{code}-{rest[:4]}-{rest[4:]}"
+                return f"{code}-{rest}"
             if len(rest) >= 7:
                 return f"{code}-{rest[:-4]}-{rest[-4:]}"
             elif len(rest) >= 4:
@@ -70,54 +63,66 @@ def format_phone(num):
 def merge_phones(*vals):
     phones = []
     for v in vals:
-        if not v: continue
+        if not v:
+            continue
         parts = re.split(r'[;:/\s]+', v)
         for p in parts:
-            p = format_phone(p)
-            if p and p not in phones:
-                phones.append(p)
+            f = format_phone(p)
+            if f and f not in phones:
+                phones.append(f)
     return ';'.join(phones)
 
-# ========== 住所整形（Address 1 - Label対応） ==========
+# ========== 住所ユーティリティ（修正版） ==========
 
-def build_address_grouped(line):
-    """Address 1 を Home/Work/Other に振り分け"""
-    label = (line.get('address_1__label') or '').strip().lower()
-    reg = (line.get('address_1__region') or '').strip()
-    city = (line.get('address_1__city') or '').strip()
+def _format_postal(pc: str) -> str:
+    d = only_digits(pc)
+    return f"{d[:3]}-{d[3:]}" if len(d) == 7 else (pc or '')
+
+def _concat_region_city_street(line: dict) -> str:
+    region = (line.get('address_1__region') or '').strip()
+    city   = (line.get('address_1__city') or '').strip()
     street = (line.get('address_1__street') or '').strip()
-    pc = (line.get('address_1__postal_code') or '').strip()
-    body = ' '.join([x for x in [reg, city, street] if x])
+    parts = [p for p in [region, city, street] if p]
+    return ' '.join(parts)
 
-    # 郵便番号整形
-    pc = only_digits(pc)
-    if len(pc) == 7:
-        pc = f"{pc[:3]}-{pc[3:]}"
-
-    # 全角変換＋建物分割
-    zbody = to_zenkaku_except_hyphen(body)
-    addr1, addr2 = zbody, ''
-    m = re.search(r'\s+', zbody)
+def _split_building_first_space(full_zenkaku: str):
+    m = re.search(r'\s+', full_zenkaku or '')
     if m:
         i = m.start()
-        addr1, addr2 = zbody[:i], zbody[i:].strip()
+        return full_zenkaku[:i], full_zenkaku[i:].strip()
+    return full_zenkaku, ''
 
-    return label, pc, addr1, addr2
+def build_address_from_address1_fields(line: dict):
+    """Address 1 - Label に応じて Home/Work/Other を判定"""
+    label_raw = (line.get('address_1__label') or '').strip().lower()
+    postal = _format_postal(line.get('address_1__postal_code') or '')
+    body_raw = _concat_region_city_street(line)
+    body_z = to_zenkaku_except_hyphen(body_raw)
+    addr1, addr2 = _split_building_first_space(body_z)
 
-# ========== メール整形 ==========
+    if 'work' in label_raw:
+        label = 'work'
+    elif 'home' in label_raw:
+        label = 'home'
+    else:
+        label = 'other'
+    return label, postal, addr1, addr2
+
+# ========== メール整形（r7dそのまま） ==========
 
 def merge_emails(*vals):
     emails = []
     for v in vals:
-        if not v: continue
+        if not v:
+            continue
         parts = re.split(r'[;:/\s]+', v)
         for p in parts:
             p = p.strip()
-            if p and '@' in p and p not in emails:
+            if '@' in p and p not in emails:
                 emails.append(p)
     return ';'.join(emails)
 
-# ========== メモ整形 ==========
+# ========== メモ整形（r7dそのまま） ==========
 
 def collect_memos(line):
     notes = (line.get('notes') or '').strip()
@@ -129,7 +134,7 @@ def collect_memos(line):
             memos.append(line[value])
     return memos, notes
 
-# ========== 会社かな生成（フェールセーフ） ==========
+# ========== 会社かな生成（r7dそのまま） ==========
 
 def company_kana(name):
     if not name:
@@ -141,7 +146,7 @@ def company_kana(name):
                 return v
     except Exception:
         pass
-    name = re.sub(r'[Ａ-Ｚａ-ｚA-Za-z]', lambda m: chr(ord(m.group(0)) + 0xFEE0) if 'A' <= m.group(0) <= 'Z' or 'a' <= m.group(0) <= 'z' else m.group(0), name)
+    name = re.sub(r'[A-Za-z]', lambda m: chr(ord(m.group(0)) + 0xFEE0), name)
     return name
 
 # ========== メイン変換処理 ==========
@@ -158,13 +163,12 @@ def convert(input_bytes):
         line = {norm_key(k): v for k, v in line.items()}
 
         r = {k: '' for k in [
-            '姓', '名', '姓かな', '名かな', '姓名', '姓名かな',
-            'ミドルネーム', 'ミドルネームかな', '敬称', 'ニックネーム', '旧姓',
-            '宛先', '自宅〒', '自宅住所1', '自宅住所2', '自宅住所3', '自宅電話',
-            '会社〒', '会社住所1', '会社住所2', '会社住所3', '会社電話',
-            'その他〒', 'その他住所1', 'その他住所2', 'その他住所3', 'その他電話',
-            '会社名かな', '会社名', '部署名1', '部署名2', '役職名',
-            'メモ1', 'メモ2', 'メモ3', 'メモ4', 'メモ5', '備考1', '誕生日'
+            '姓','名','姓かな','名かな','姓名','姓名かな','ミドルネーム','ミドルネームかな','敬称',
+            'ニックネーム','旧姓','宛先','自宅〒','自宅住所1','自宅住所2','自宅住所3','自宅電話',
+            '会社〒','会社住所1','会社住所2','会社住所3','会社電話',
+            'その他〒','その他住所1','その他住所2','その他住所3','その他電話',
+            '会社名かな','会社名','部署名1','部署名2','役職名',
+            'メモ1','メモ2','メモ3','メモ4','メモ5','備考1','誕生日'
         ]}
 
         r['姓'] = (line.get('last_name') or '').strip()
@@ -179,32 +183,32 @@ def convert(input_bytes):
         r['部署名1'] = (line.get('organization_department') or '').strip()
         r['役職名'] = (line.get('organization_title') or '').strip()
 
-        label, pc, a1, a2 = build_address_grouped(line)
-        if 'work' in label:
+        # --- 住所部分（修正版） ---
+        label, pc, a1, a2 = build_address_from_address1_fields(line)
+        if label == 'work':
             r['会社〒'], r['会社住所1'], r['会社住所2'] = pc, a1, a2
-        elif 'home' in label:
+        elif label == 'home':
             r['自宅〒'], r['自宅住所1'], r['自宅住所2'] = pc, a1, a2
         else:
             r['その他〒'], r['その他住所1'], r['その他住所2'] = pc, a1, a2
 
-        phones = merge_phones(
+        r['会社電話'] = merge_phones(
             line.get('phone_1__value'),
             line.get('phone_2__value'),
             line.get('phone_3__value')
         )
-        r['会社電話'] = phones
 
-        emails = merge_emails(
+        r['備考1'] = merge_emails(
             line.get('e_mail_1__value'),
             line.get('e_mail_2__value'),
             line.get('e_mail_3__value')
         )
-        r['備考1'] = emails
 
         memos, notes = collect_memos(line)
         for i, m in enumerate(memos[:5], 1):
             r[f'メモ{i}'] = m
-        r['備考1'] = notes or r['備考1']
+        if notes:
+            r['備考1'] = notes
         r['誕生日'] = (line.get('birthday') or '').strip()
 
         rows.append(r)
@@ -224,5 +228,5 @@ if __name__ == "__main__":
     with open(input_path, 'rb') as f:
         input_bytes = f.read()
     result = convert(input_bytes)
-    print("# Google → Atena 変換結果（v3.9.18r7e）\n")
+    print("# Google → Atena 変換結果（v3.9.18r7d+addrfix）\n")
     print(result)

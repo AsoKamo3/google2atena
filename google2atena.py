@@ -1,9 +1,11 @@
-# google2atena.py  v3.9.18r7d+addrfix  (Render安定版 / no-pandas)
-# - v3.9.18r7d をベースに、住所部分のみ修正
-# - Address 1 - Label に基づき Home / Work / Other へ振り分け
-# - 電話・メール・メモ・誕生日などの処理は変更なし
+# google2atena.py  v3.9.18r7d+addrfix+webapp  (Render安定版 / no-pandas)
+# - v3.9.18r7d をベースに、住所部分のみ修正（Address 1 - Label 判定）
+# - Flaskアプリ構成を維持
+# - 電話／メール／メモ／誕生日／会社かなロジックは r7d と同一
+# - 出力：CSV (UTF-8-SIG) ダウンロード対応
 
-import csv, io, re, sys, os, chardet, unicodedata
+import csv, io, re, sys, os, chardet, unicodedata, tempfile
+from flask import Flask, request, send_file
 
 # ========== 共通関数 ==========
 
@@ -192,18 +194,21 @@ def convert(input_bytes):
         else:
             r['その他〒'], r['その他住所1'], r['その他住所2'] = pc, a1, a2
 
+        # 電話
         r['会社電話'] = merge_phones(
             line.get('phone_1__value'),
             line.get('phone_2__value'),
             line.get('phone_3__value')
         )
 
+        # メール
         r['備考1'] = merge_emails(
             line.get('e_mail_1__value'),
             line.get('e_mail_2__value'),
             line.get('e_mail_3__value')
         )
 
+        # メモ＋備考
         memos, notes = collect_memos(line)
         for i, m in enumerate(memos[:5], 1):
             r[f'メモ{i}'] = m
@@ -219,14 +224,36 @@ def convert(input_bytes):
     writer.writerows(rows)
     return output.getvalue()
 
-# ========== Render出力 ==========
+# ========== Flaskアプリ部分 ==========
+
+app = Flask(__name__)
+
+@app.route("/", methods=["GET"])
+def index():
+    return f"""
+    <h2>Google → Atena 変換ツール</h2>
+    <p>Version: <b>v3.9.18r7d+addrfix+webapp</b></p>
+    <form action="/convert" method="post" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".csv" required>
+      <button type="submit">変換実行</button>
+    </form>
+    """
+
+@app.route("/convert", methods=["POST"])
+def convert_route():
+    f = request.files.get("file")
+    if not f:
+        return "⚠️ ファイルが指定されていません。", 400
+    data = f.read()
+    try:
+        result = convert(data)
+    except Exception as e:
+        return f"⚠️ エラーが発生しました: {e}", 500
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    tmp.write(result.encode("utf-8-sig"))
+    tmp.seek(0)
+    return send_file(tmp.name, as_attachment=True, download_name="converted.csv", mimetype="text/csv")
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python google2atena.py input.csv > output.csv")
-        sys.exit(1)
-    input_path = sys.argv[1]
-    with open(input_path, 'rb') as f:
-        input_bytes = f.read()
-    result = convert(input_bytes)
-    print("# Google → Atena 変換結果（v3.9.18r7d+addrfix）\n")
-    print(result)
+    app.run(host="0.0.0.0", port=10000)

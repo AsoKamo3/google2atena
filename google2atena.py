@@ -1,296 +1,301 @@
-# google2atena.py  v3.9.18r7d (Render安定版 / no-pandas)
-# 住所／電話／メモ抽出などは v3.9.18r7c と同等。
-# この版ではアプリUIにバージョン名を明示表示。
+# google2atena.py  v3.9.18r7b  (Render安定版 / no-pandas)
+# - 電話番号整形強化（050/090/0120/0570/市外局番パターン対応）
+# - 他機能は r7a と同一（住所振り分け、フェイルセーフ、メモ、メール整形など）
 
-from flask import Flask, request, send_file, render_template_string
-import io, csv, re, codecs
-import chardet
+import csv
+import io
+import re
+import unicodedata
+from flask import Flask, render_template_string, request, send_file
 
-# ---- 外部辞書（フェイルセーフ） -------------------------------------------------
+# ======== 外部辞書フェイルセーフ ========
 try:
-    from company_dicts import COMPANY_REPLACE_MAP
+    from company_dicts import COMPANY_EXCEPT
 except Exception:
-    COMPANY_REPLACE_MAP = {}
+    COMPANY_EXCEPT = {}
 
 try:
-    from kanji_word_map import EN_TO_KATAKANA_MAP
+    from kanji_word_map import KANJI_WORD_MAP
 except Exception:
-    EN_TO_KATAKANA_MAP = {}
+    KANJI_WORD_MAP = {}
 
 try:
     from corp_terms import CORP_TERMS
 except Exception:
-    CORP_TERMS = set()
-
-# jp_area_codes は安定版（旧短縮）
-from jp_area_codes import AREA_CODES
+    CORP_TERMS = [
+        "株式会社", "有限会社", "合同会社", "合資会社", "相互会社",
+        "一般社団法人", "一般財団法人", "公益社団法人", "公益財団法人",
+        "特定非営利活動法人", "ＮＰＯ法人", "学校法人", "医療法人",
+        "宗教法人", "社会福祉法人", "公立大学法人", "独立行政法人", "地方独立行政法人"
+    ]
 
 app = Flask(__name__)
 
-# ---- UI（バージョン表示付き） -----------------------------------------------------
-INDEX_HTML = """<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<title>google2atena v3.9.18r7d</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
- body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,"Noto Sans JP","Apple Color Emoji","Segoe UI Emoji";margin:24px;}
- .card{border:1px solid #ddd;border-radius:12px;padding:16px;max-width:780px}
- input[type=file]{margin:.5rem 0}
- button{padding:.6rem 1rem;border-radius:8px;border:1px solid #333;background:#111;color:#fff;cursor:pointer}
- .small{color:#666;font-size:.9em}
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>google2atena v3.9.18r7d</h1>
-  <p>（Render安定版 / no-pandas）</p>
-  <form action="/convert" method="post" enctype="multipart/form-data">
-    <p>Google 連絡先の CSV/TSV をアップロードしてください。</p>
-    <input type="file" name="file" accept=".csv,.tsv,.txt" required>
-    <div><button type="submit">変換する</button></div>
-  </form>
-  <p class="small">出力: UTF-8 (BOM付) CSV / 住所は全角（郵便・電話のみ半角ハイフン付）</p>
-</div>
-</body>
-</html>"""
+# ======== 住所ユーティリティ ========
 
-# ---- 共通関数群 ---------------------------------------------------------------
-def to_zenkaku_except_hyphen(s: str) -> str:
+def to_zenkaku_for_address(s: str) -> str:
     if not s:
-        return s
-    s = s.replace('-', '\u0000')
-    tbl = {ord(c): ord(c) + 0xFEE0 for c in ''.join(chr(i) for i in range(33, 127))}
-    s = s.translate(tbl)
-    s = s.replace('\u0000', '－')
-    return s
+        return ""
+    z = []
+    for ch in s:
+        code = ord(ch)
+        if 0x21 <= code <= 0x7E:
+            if ch == '-':
+                z.append('－')
+            else:
+                z.append(unicodedata.normalize('NFKC', ch))
+        else:
+            z.append(ch)
+    return "".join(z)
 
-def norm_key(k: str) -> str:
-    return (k or '').strip().lower().replace(' ', '_').replace('-', '_')
+def format_postal(postal: str) -> str:
+    if not postal:
+        return ""
+    digits = re.sub(r'\D', '', postal)
+    if len(digits) == 7:
+        return f"{digits[:3]}-{digits[3:]}"
+    return postal
 
-def get(row, *keys, default=''):
-    for k in keys:
-        v = row.get(k)
-        if v:
-            return v
-    return default
+_SPLIT_RE = re.compile(r'[ \u3000]')
 
-def only_digits(s: str) -> str:
-    return re.sub(r'\D', '', s or '')
+def split_first_space(addr_full: str):
+    if not addr_full:
+        return ("", "")
+    m = _SPLIT_RE.search(addr_full)
+    if not m:
+        return (addr_full, "")
+    i = m.start()
+    return (addr_full[:i], addr_full[i+1:].strip())
 
-# ---- 電話正規化 ---------------------------------------------------------------
-MOBILE_PREFIX = ('070', '080', '090')
-SPECIALS = ('0120', '0800', '0570', '050')
+def build_addr12(region, city, street):
+    parts = [p for p in [region, city, street] if p]
+    full = "".join(parts)
+    full_z = to_zenkaku_for_address(full)
+    a1, a2 = split_first_space(full_z)
+    return (a1, a2)
 
-def normalize_single_phone(raw: str) -> str:
-    if not raw:
-        return ''
-    n = only_digits(raw)
-    if len(n) == 9 and not n.startswith('0'):
-        n = '0' + n
-    # 携帯
-    if len(n) == 11 and n.startswith(MOBILE_PREFIX):
-        return f"{n[:3]}-{n[3:7]}-{n[7:]}"
-    # IP
-    if len(n) == 11 and n.startswith('050'):
-        return f"{n[:3]}-{n[3:7]}-{n[7:]}"
-    # 特番
-    if len(n) == 10 and n.startswith('0120'):
-        return f"{n[:4]}-{n[4:7]}-{n[7:]}"
-    if len(n) == 10 and n.startswith('0800'):
-        return f"{n[:4]}-{n[4:7]}-{n[7:]}"
-    if len(n) == 10 and n.startswith('0570'):
-        return f"{n[:4]}-{n[4:6]}-{n[6:]}"
-    # 固定
-    if len(n) == 10 and n.startswith('0'):
-        for code in AREA_CODES:
-            if n.startswith(code):
-                rest = n[len(code):]
-                mid = len(rest) - 4
-                return f"{code}-{rest[:mid]}-{rest[mid:]}"
-    return n
+def route_address_by_label(row, out):
+    label = (row.get('Address 1 - Label') or "").strip().lower()
+    region = row.get('Address 1 - Region') or ""
+    city   = row.get('Address 1 - City') or ""
+    street = row.get('Address 1 - Street') or ""
+    postal = row.get('Address 1 - Postal Code') or ""
 
-def normalize_phones(*vals):
-    parts = []
-    for v in vals:
-        if not v:
-            continue
-        for p in re.split(r'\s*:::\s*|[;,、；]\s*|\s+', str(v)):
-            if p.strip():
-                parts.append(p.strip())
-    out = []
-    seen = set()
-    for p in parts:
-        f = normalize_single_phone(p)
-        if f and f not in seen:
-            seen.add(f)
-            out.append(f)
-    return ';'.join(out)
+    jp_postal = format_postal(postal)
+    addr1, addr2 = build_addr12(region, city, street)
 
-# ---- メール正規化 --------------------------------------------------------------
-def normalize_emails(*vals):
-    out = []
-    seen = set()
-    for v in vals:
-        if not v:
-            continue
-        for p in re.split(r'\s*:::\s*|[;,\s]\s*', str(v)):
-            if p and '@' in p and '.' in p.split('@')[-1]:
-                pl = p.lower()
-                if pl not in seen:
-                    seen.add(pl)
-                    out.append(p)
-    return ';'.join(out)
+    if label == 'home':
+        out['自宅〒']    = jp_postal
+        out['自宅住所1'] = addr1
+        out['自宅住所2'] = addr2
+        out['自宅住所3'] = ""
+    elif label == 'other':
+        out['その他〒']    = jp_postal
+        out['その他住所1'] = addr1
+        out['その他住所2'] = addr2
+        out['その他住所3'] = ""
+    else:
+        out['会社〒']    = jp_postal
+        out['会社住所1'] = addr1
+        out['会社住所2'] = addr2
+        out['会社住所3'] = ""
 
-# ---- 住所 ----------------------------------------------------------------------
-def build_address(line):
-    reg = (line.get('address_1__region') or '').strip()
-    city = (line.get('address_1__city') or '').strip()
-    street = (line.get('address_1__street') or '').strip()
-    body = ' '.join([x for x in [reg, city, street] if x])
-    zbody = to_zenkaku_except_hyphen(body)
-    addr1, addr2 = zbody, ''
-    m = re.search(r'\s+', zbody)
-    if m:
-        i = m.start()
-        addr1, addr2 = zbody[:i], zbody[i:].strip()
-    pc = (line.get('address_1__postal_code') or '').strip()
-    pc = only_digits(pc)
-    if len(pc) == 7:
-        pc = f"{pc[:3]}-{pc[3:]}"
-    return pc, addr1, addr2
+# ======== 電話番号整形 ========
 
-# ---- 会社名かな ---------------------------------------------------------------
-def simple_en_to_katakana(s: str) -> str:
-    if not s:
-        return s
-    t = s
-    if EN_TO_KATAKANA_MAP:
-        for en, ka in EN_TO_KATAKANA_MAP.items():
-            t = re.sub(rf'\b{re.escape(en)}\b', ka, t, flags=re.IGNORECASE)
-    return t
-
-def apply_company_replace(s: str) -> str:
-    t = s or ''
-    for k, v in COMPANY_REPLACE_MAP.items():
-        t = t.replace(k, v)
-    return t
-
-def guess_company_kana(name: str) -> str:
-    if not name:
-        return ''
-    return simple_en_to_katakana(apply_company_replace(name))
-
-# ---- 出力カラム ---------------------------------------------------------------
-OUTPUT_HEADERS = [
-    '姓','名','姓かな','名かな','姓名','姓名かな','ミドルネーム','ミドルネームかな','敬称','ニックネーム','旧姓','宛先',
-    '自宅〒','自宅住所1','自宅住所2','自宅住所3','自宅電話','自宅IM ID','自宅E-mail','自宅URL','自宅Social',
-    '会社〒','会社住所1','会社住所2','会社住所3','会社電話','会社IM ID','会社E-mail','会社URL','会社Social',
-    'その他〒','その他住所1','その他住所2','その他住所3','その他電話','その他IM ID','その他E-mail','その他URL','その他Social',
-    '会社名かな','会社名','部署名1','部署名2','役職名','連名','連名ふりがな','連名敬称','連名誕生日',
-    'メモ1','メモ2','メモ3','メモ4','メモ5','備考1','備考2','備考3','誕生日','性別','血液型','趣味','性格'
+# 全国市外局番パターン（抜粋・代表）
+CITY_CODES = [
+    '011','015','017','018','019','022','023','024','025','026','027','028','029',
+    '03','04','042','043','044','045','046','047','048','049','052','053','054',
+    '055','056','057','058','059','06','072','073','074','075','076','077','078',
+    '079','082','083','084','085','086','087','088','089','092','093','094','095',
+    '096','097','098','099'
 ]
 
-# ---- 変換本体 ---------------------------------------------------------------
-def convert(rows):
-    out = []
-    for line in rows:
-        r = {h: '' for h in OUTPUT_HEADERS}
-        r['姓'] = get(line, 'last_name')
-        r['名'] = get(line, 'first_name')
-        r['姓かな'] = get(line, 'phonetic_last_name')
-        r['名かな'] = get(line, 'phonetic_first_name')
-        r['姓名'] = (r['姓'] + '　' + r['名']).strip()
-        r['姓名かな'] = (r['姓かな'] + '　' + r['名かな']).strip()
-        r['敬称'] = '様'
-        r['宛先'] = '会社'
+def normalize_phones(phone_values):
+    phones = []
+    for val in phone_values:
+        if not val:
+            continue
+        nums = re.sub(r'\D', '', val)
+        if not nums:
+            continue
+        if not nums.startswith('0'):
+            nums = '0' + nums
 
-        org = get(line, 'organization_name')
-        dept = get(line, 'organization_department')
-        title = get(line, 'organization_title')
-        r['会社名'] = org
-        r['会社名かな'] = guess_company_kana(org)
-        if dept:
-            parts = re.split(r'\s+', dept.strip(), 1)
-            r['部署名1'] = parts[0]
-            r['部署名2'] = parts[1] if len(parts) > 1 else ''
-        r['役職名'] = title
+        formatted = nums
 
-        r['会社電話'] = normalize_phones(
-            get(line, 'phone_1___value') if get(line, 'phone_1___label') == 'Work' else '',
-            get(line, 'phone_2___value') if get(line, 'phone_2___label') == 'Work' else '',
-            get(line, 'phone_1___value') if get(line, 'phone_1___label') == 'Mobile' else '',
-            get(line, 'phone_2___value') if get(line, 'phone_2___label') == 'Mobile' else ''
-        )
-        r['自宅電話'] = normalize_phones(
-            get(line, 'phone_1___value') if get(line, 'phone_1___label') == 'Home' else '',
-            get(line, 'phone_2___value') if get(line, 'phone_2___label') == 'Home' else ''
-        )
+        # 携帯・PHS・IP電話・フリーダイヤル等の特殊系
+        if re.match(r'^0(70|80|90)\d{8}$', nums):
+            formatted = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
+        elif re.match(r'^050\d{8}$', nums):  # IP電話
+            formatted = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
+        elif re.match(r'^(0120|0800|0570)\d{6}$', nums):  # 特番
+            formatted = f"{nums[:4]}-{nums[4:7]}-{nums[7:]}"
+        elif len(nums) == 10:  # 固定電話（市外局番判定）
+            for code in sorted(CITY_CODES, key=len, reverse=True):
+                if nums.startswith(code):
+                    remain = nums[len(code):]
+                    if len(remain) == 7:
+                        formatted = f"{code}-{remain[:3]}-{remain[3:]}"
+                    elif len(remain) == 6:
+                        formatted = f"{code}-{remain[:2]}-{remain[2:]}"
+                    break
+        elif len(nums) == 9:  # 旧地方形式
+            formatted = f"{nums[:2]}-{nums[2:5]}-{nums[5:]}"
+        else:
+            formatted = nums
 
-        r['会社E-mail'] = normalize_emails(
-            get(line, 'e_mail_1___value') if get(line, 'e_mail_1___label') == 'Work' else '',
-            get(line, 'e_mail_2___value') if get(line, 'e_mail_2___label') == 'Work' else ''
-        )
-        r['自宅E-mail'] = normalize_emails(
-            get(line, 'e_mail_1___value') if get(line, 'e_mail_1___label') == 'Home' else '',
-            get(line, 'e_mail_2___value') if get(line, 'e_mail_2___label') == 'Home' else ''
-        )
+        if formatted not in phones:
+            phones.append(formatted)
 
-        pc, a1, a2 = build_address(line)
-        r['会社〒'], r['会社住所1'], r['会社住所2'] = pc, a1, a2
+    return ";".join(phones)
 
-        r['備考1'] = get(line, 'notes')
-        r['誕生日'] = get(line, 'birthday')
-        out.append(r)
-    return out
+# ======== メール整形 ========
 
-# ---- 取込・出力 ---------------------------------------------------------------
-def sniff_dialect_and_read(fb: bytes):
-    det = chardet.detect(fb)
-    enc = det.get('encoding') or 'utf-8'
-    txt = fb.decode(enc, errors='replace')
-    try:
-        sniffer = csv.Sniffer()
-        dialect = sniffer.sniff(txt[:4000], delimiters=[',','\t',';'])
-    except Exception:
-        class D(csv.Dialect):
-            delimiter='\t';quotechar='"';escapechar=None;doublequote=True
-            lineterminator='\n';quoting=csv.QUOTE_MINIMAL
-        dialect=D()
-    reader = csv.reader(io.StringIO(txt), dialect)
-    rows = list(reader)
-    if not rows:
-        raise ValueError
-    header = [norm_key(h) for h in rows[0]]
-    dicts = []
-    for rec in rows[1:]:
-        d = {}
-        for i,v in enumerate(rec):
-            if i<len(header): d[header[i]]=v
-        dicts.append(d)
-    return dicts
+def normalize_emails(email_values):
+    emails = []
+    for val in email_values:
+        if not val:
+            continue
+        val = val.strip()
+        if val and val not in emails:
+            emails.append(val)
+    return ";".join(emails)
 
-@app.route('/', methods=['GET'])
+# ======== メモ抽出 ========
+
+def extract_memos(row):
+    memos = []
+    for i in range(1, 6):
+        label = row.get(f"Relation {i} - Label", "")
+        value = row.get(f"Relation {i} - Value", "")
+        if label and "メモ" in label and value:
+            memos.append(value)
+    notes = row.get("Notes", "")
+    if notes:
+        memos.append(notes)
+    return memos
+
+# ======== 会社名かな変換 ========
+
+def kana_company_name(name):
+    if not name:
+        return ""
+    if name in COMPANY_EXCEPT:
+        return COMPANY_EXCEPT[name]
+    result = name
+    for k, v in KANJI_WORD_MAP.items():
+        if k in result:
+            result = result.replace(k, v)
+    return result
+
+# ======== HTMLフォーム ========
+
+html_form = """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Google→宛名職人 CSV 変換</title>
+</head>
+<body>
+<h2>Google連絡先 → 宛名職人 CSV 変換ツール</h2>
+<form action="/convert" method="post" enctype="multipart/form-data">
+  <input type="file" name="file" accept=".csv" required>
+  <input type="submit" value="変換開始">
+</form>
+</body>
+</html>
+"""
+
+# ======== Flask Routes ========
+
+@app.route("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    return render_template_string(html_form)
 
-@app.route('/convert', methods=['POST'])
-def convert_csv():
-    f = request.files.get('file')
-    if not f: return "ファイルを選択してください",400
-    try:
-        fb = f.read()
-        rows = sniff_dialect_and_read(fb)
-        outrows = convert(rows)
-        buf = io.StringIO()
-        w = csv.writer(buf, lineterminator='\n')
-        w.writerow(OUTPUT_HEADERS)
-        for r in outrows: w.writerow([r.get(h,'') for h in OUTPUT_HEADERS])
-        data = buf.getvalue().encode('utf-8-sig')
-        return send_file(io.BytesIO(data),mimetype='text/csv',as_attachment=True,download_name='google2atena_converted.csv')
-    except Exception as e:
-        return "⚠️ エラーが発生しました。CSVの形式や文字コードをご確認ください。",400
+@app.route("/convert", methods=["POST"])
+def convert():
+    file = request.files["file"]
+    if not file:
+        return "⚠️ ファイルが選択されていません。"
 
-if __name__=='__main__':
-    app.run(host='0.0.0.0',port=10000)
+    data = file.read()
+    text = data.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    header = [
+        "姓","名","姓かな","名かな","姓名","姓名かな","ミドルネーム","ミドルネームかな","敬称",
+        "ニックネーム","旧姓","宛先","自宅〒","自宅住所1","自宅住所2","自宅住所3","自宅電話",
+        "自宅IM ID","自宅E-mail","自宅URL","自宅Social",
+        "会社〒","会社住所1","会社住所2","会社住所3","会社電話","会社IM ID","会社E-mail",
+        "会社URL","会社Social",
+        "その他〒","その他住所1","その他住所2","その他住所3","その他電話","その他IM ID",
+        "その他E-mail","その他URL","その他Social",
+        "会社名かな","会社名","部署名1","部署名2","役職名",
+        "連名","連名ふりがな","連名敬称","連名誕生日",
+        "メモ1","メモ2","メモ3","メモ4","メモ5",
+        "備考1","備考2","備考3","誕生日","性別","血液型","趣味","性格"
+    ]
+    writer.writerow(header)
+
+    for row in reader:
+        out = {}
+
+        # --- 住所 ---
+        route_address_by_label(row, out)
+
+        # --- 電話 ---
+        phones = [row.get("Phone 1 - Value", ""), row.get("Phone 2 - Value", "")]
+        out["会社電話"] = normalize_phones(phones)
+
+        # --- メール ---
+        emails = [
+            row.get("E-mail 1 - Value", ""),
+            row.get("E-mail 2 - Value", ""),
+            row.get("E-mail 3 - Value", "")
+        ]
+        out["会社E-mail"] = normalize_emails(emails)
+
+        # --- メモ ---
+        memos = extract_memos(row)
+        for i in range(5):
+            out[f"メモ{i+1}"] = memos[i] if i < len(memos) else ""
+
+        # --- 会社名かな ---
+        company_name = row.get("Organization Name", "")
+        out["会社名"] = company_name
+        out["会社名かな"] = kana_company_name(company_name)
+
+        writer.writerow([
+            row.get("Last Name",""), row.get("First Name",""),
+            row.get("Phonetic Last Name",""), row.get("Phonetic First Name",""),
+            f"{row.get('Last Name','')}　{row.get('First Name','')}",
+            f"{row.get('Phonetic Last Name','')}{row.get('Phonetic First Name','')}",
+            "", "", "様", row.get("Nickname",""), "",
+            "会社",
+            out.get("自宅〒",""), out.get("自宅住所1",""), out.get("自宅住所2",""), out.get("自宅住所3",""),
+            out.get("自宅電話",""), "", "", "", "",
+            out.get("会社〒",""), out.get("会社住所1",""), out.get("会社住所2",""), out.get("会社住所3",""),
+            out.get("会社電話",""), "", out.get("会社E-mail",""), "", "",
+            out.get("その他〒",""), out.get("その他住所1",""), out.get("その他住所2",""), out.get("その他住所3",""),
+            out.get("その他電話",""), "", "", "", "",
+            out.get("会社名かな",""), out.get("会社名",""),
+            row.get("Organization Department",""), "", row.get("Organization Title",""),
+            "","","","",
+            out.get("メモ1",""), out.get("メモ2",""), out.get("メモ3",""), out.get("メモ4",""), out.get("メモ5",""),
+            "", "", "", "", "", "", "", ""
+        ])
+
+    output.seek(0)
+    return send_file(
+        io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="converted.csv"
+    )
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)

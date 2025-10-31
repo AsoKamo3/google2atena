@@ -1,6 +1,6 @@
-# google2atena.py  v3.9.18r7b+addrformatted_reverse_priority_10x  (Render安定版 / no-pandas)
-# - 住所変換 Formatted優先対応（1行目Street / 2行目City / 3行目Region / 4行目Postal）
-# - 他の部分はv3.9.18r7bと同一（電話・メール・メモ・かな変換・フェイルセーフ等）
+# google2atena.py  v3.9.18r7b+addrformatted_smart_4or5line_10x  (Render安定版 / no-pandas)
+# - Address Formatted に4行/5行構造対応
+# - 他の部分は v3.9.18r7b と同一（電話・メール・メモ・かな変換・フェイルセーフ等）
 
 import csv
 import io
@@ -74,10 +74,12 @@ def build_addr12(region, city, street):
     a1, a2 = split_first_space(full_z)
     return (a1, a2)
 
+# ======== route_address_by_label ========
+
 def route_address_by_label(row, out):
     """
     Addressブロックを参照して、自宅／会社／その他の住所に振り分ける。
-    Formatted優先仕様（1行目Street / 2行目City / 3行目Region / 4行目Postal）
+    Formatted優先仕様（4行／5行対応）
     """
     label = (row.get('Address 1 - Label') or "").strip().lower()
 
@@ -87,18 +89,38 @@ def route_address_by_label(row, out):
     street = row.get("Address 1 - Street") or ""
     postal = row.get("Address 1 - Postal Code") or ""
 
+    # --- Formatted優先処理 ---
     if formatted:
         lines = [l.strip() for l in formatted.splitlines() if l.strip()]
-        if len(lines) >= 1:
+        n = len(lines)
+        if n >= 5:
+            # 5行形式
             street = lines[0]
-        if len(lines) >= 2:
             city = lines[1]
-        if len(lines) >= 3:
             region = lines[2]
-        if len(lines) >= 4:
             postal = lines[3]
+        elif n == 4:
+            # 4行形式
+            line1 = lines[0]
+            region = lines[1]
+            postal = lines[2]
+            # City + Street 推定
+            if " " in line1 or "　" in line1:
+                city, street = split_first_space(line1)
+            else:
+                city = ""
+                street = line1
+        elif n == 3:
+            # fallback
+            street = lines[0]
+            region = lines[1]
+            postal = lines[2]
+        elif n == 2:
+            street = lines[0]
+            region = lines[1]
+        elif n == 1:
+            street = lines[0]
 
-    # Formattedが空の場合は旧仕様
     jp_postal = format_postal(postal)
     addr1, addr2 = build_addr12(region, city, street)
 
@@ -214,7 +236,7 @@ html_form = """
 <title>Google→宛名職人 CSV 変換</title>
 </head>
 <body>
-<h2>Google連絡先 → 宛名職人 CSV 変換ツール<br>v3.9.18r7b+addrformatted_reverse_priority_10x</h2>
+<h2>Google連絡先 → 宛名職人 CSV 変換ツール<br>v3.9.18r7b+addrformatted_smart_4or5line_10x</h2>
 <form action="/convert" method="post" enctype="multipart/form-data">
   <input type="file" name="file" accept=".csv" required>
   <input type="submit" value="変換開始">

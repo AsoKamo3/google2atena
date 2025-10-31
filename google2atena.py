@@ -1,6 +1,7 @@
-# google2atena.py  v3.9.18r7b+addrformatted_smart_4or5line_10x  (Render安定版 / no-pandas)
-# - Address Formatted に4行/5行構造対応
-# - 他の部分は v3.9.18r7b と同一（電話・メール・メモ・かな変換・フェイルセーフ等）
+# google2atena.py  v3.9.19  (Render安定版 / no-pandas)
+# - 電話・メール最大10件対応
+# - HTMLタイトルにバージョン明記
+# - 住所分割・かな変換・メモ抽出・フェイルセーフ等は v3.9.18r7b+addrformatted_smart_4or5line_10x と同一
 
 import csv
 import io
@@ -74,71 +75,57 @@ def build_addr12(region, city, street):
     a1, a2 = split_first_space(full_z)
     return (a1, a2)
 
-# ======== route_address_by_label ========
+def parse_formatted_address(formatted):
+    """Address n - Formatted が4〜5行の場合に対応"""
+    if not formatted:
+        return "", "", "", ""
+    lines = [l.strip() for l in formatted.splitlines() if l.strip()]
+    street = city = region = postal = ""
+    if len(lines) >= 5:
+        street, city, region, postal = lines[:4]
+    elif len(lines) == 4:
+        city_street, region, postal = lines[:3]
+        m = re.match(r"(.+?)[ 　](.+)", city_street)
+        if m:
+            city, street = m.group(1), m.group(2)
+        else:
+            city = city_street
+    return region, city, street, postal
 
 def route_address_by_label(row, out):
-    """
-    Addressブロックを参照して、自宅／会社／その他の住所に振り分ける。
-    Formatted優先仕様（4行／5行対応）
-    """
-    label = (row.get('Address 1 - Label') or "").strip().lower()
+    for n in range(1, 3):  # Address 1, Address 2 に対応
+        label = (row.get(f"Address {n} - Label") or "").strip().lower()
+        formatted = row.get(f"Address {n} - Formatted", "")
+        region = row.get(f"Address {n} - Region") or ""
+        city   = row.get(f"Address {n} - City") or ""
+        street = row.get(f"Address {n} - Street") or ""
+        postal = row.get(f"Address {n} - Postal Code") or ""
 
-    formatted = row.get("Address 1 - Formatted") or ""
-    region = row.get("Address 1 - Region") or ""
-    city   = row.get("Address 1 - City") or ""
-    street = row.get("Address 1 - Street") or ""
-    postal = row.get("Address 1 - Postal Code") or ""
+        if formatted:
+            region_f, city_f, street_f, postal_f = parse_formatted_address(formatted)
+            region = region or region_f
+            city   = city or city_f
+            street = street or street_f
+            postal = postal or postal_f
 
-    # --- Formatted優先処理 ---
-    if formatted:
-        lines = [l.strip() for l in formatted.splitlines() if l.strip()]
-        n = len(lines)
-        if n >= 5:
-            # 5行形式
-            street = lines[0]
-            city = lines[1]
-            region = lines[2]
-            postal = lines[3]
-        elif n == 4:
-            # 4行形式
-            line1 = lines[0]
-            region = lines[1]
-            postal = lines[2]
-            # City + Street 推定
-            if " " in line1 or "　" in line1:
-                city, street = split_first_space(line1)
-            else:
-                city = ""
-                street = line1
-        elif n == 3:
-            # fallback
-            street = lines[0]
-            region = lines[1]
-            postal = lines[2]
-        elif n == 2:
-            street = lines[0]
-            region = lines[1]
-        elif n == 1:
-            street = lines[0]
+        jp_postal = format_postal(postal)
+        addr1, addr2 = build_addr12(region, city, street)
 
-    jp_postal = format_postal(postal)
-    addr1, addr2 = build_addr12(region, city, street)
-
-    if label == 'home':
-        out['自宅〒']    = jp_postal
-        out['自宅住所1'] = addr1
-        out['自宅住所2'] = addr2
-        out['自宅住所3'] = ""
-    elif label == 'other':
-        out['その他〒']    = jp_postal
-        out['その他住所1'] = addr1
-        out['その他住所2'] = addr2
-        out['その他住所3'] = ""
-    else:
-        out['会社〒']    = jp_postal
-        out['会社住所1'] = addr1
-        out['会社住所2'] = addr2
-        out['会社住所3'] = ""
+        if label == 'home':
+            out['自宅〒']    = jp_postal
+            out['自宅住所1'] = addr1
+            out['自宅住所2'] = addr2
+            out['自宅住所3'] = ""
+        elif label == 'other':
+            out['その他〒']    = jp_postal
+            out['その他住所1'] = addr1
+            out['その他住所2'] = addr2
+            out['その他住所3'] = ""
+        else:
+            out['会社〒']    = jp_postal
+            out['会社住所1'] = addr1
+            out['会社住所2'] = addr2
+            out['会社住所3'] = ""
 
 # ======== 電話番号整形 ========
 
@@ -185,6 +172,7 @@ def normalize_phones(phone_values):
 
         if formatted not in phones:
             phones.append(formatted)
+
     return ";".join(phones)
 
 # ======== メール整形 ========
@@ -203,7 +191,7 @@ def normalize_emails(email_values):
 
 def extract_memos(row):
     memos = []
-    for i in range(1, 6):
+    for i in range(1, 11):
         label = row.get(f"Relation {i} - Label", "")
         value = row.get(f"Relation {i} - Value", "")
         if label and "メモ" in label and value:
@@ -233,10 +221,10 @@ html_form = """
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>Google→宛名職人 CSV 変換</title>
+<title>Google→宛名職人 CSV 変換 v3.9.19</title>
 </head>
 <body>
-<h2>Google連絡先 → 宛名職人 CSV 変換ツール<br>v3.9.18r7b+addrformatted_smart_4or5line_10x</h2>
+<h2>Google連絡先 → 宛名職人 CSV 変換ツール <small>v3.9.19</small></h2>
 <form action="/convert" method="post" enctype="multipart/form-data">
   <input type="file" name="file" accept=".csv" required>
   <input type="submit" value="変換開始">
@@ -280,18 +268,24 @@ def convert():
 
     for row in reader:
         out = {}
+
+        # --- 住所 ---
         route_address_by_label(row, out)
-        phones = [row.get("Phone 1 - Value", ""), row.get("Phone 2 - Value", "")]
-        out["会社電話"] = normalize_phones(phones)
-        emails = [
-            row.get("E-mail 1 - Value", ""),
-            row.get("E-mail 2 - Value", ""),
-            row.get("E-mail 3 - Value", "")
-        ]
-        out["会社E-mail"] = normalize_emails(emails)
+
+        # --- 電話 ---
+        phone_values = [row.get(f"Phone {i} - Value", "") for i in range(1, 11)]
+        out["会社電話"] = normalize_phones(phone_values)
+
+        # --- メール ---
+        email_values = [row.get(f"E-mail {i} - Value", "") for i in range(1, 11)]
+        out["会社E-mail"] = normalize_emails(email_values)
+
+        # --- メモ ---
         memos = extract_memos(row)
         for i in range(5):
             out[f"メモ{i+1}"] = memos[i] if i < len(memos) else ""
+
+        # --- 会社名かな ---
         company_name = row.get("Organization Name", "")
         out["会社名"] = company_name
         out["会社名かな"] = kana_company_name(company_name)
@@ -313,7 +307,7 @@ def convert():
             row.get("Organization Department",""), "", row.get("Organization Title",""),
             "","","","",
             out.get("メモ1",""), out.get("メモ2",""), out.get("メモ3",""), out.get("メモ4",""), out.get("メモ5",""),
-            "", "", "", "", "", "", "", ""
+            "", "", "", row.get("Birthday",""), "", "", "", ""
         ])
 
     output.seek(0)

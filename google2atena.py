@@ -1,6 +1,8 @@
-# google2atena.py  v3.9.18r7b  (Render安定版 / no-pandas)
-# - 電話番号整形強化（050/090/0120/0570/市外局番パターン対応）
-# - 他機能は r7a と同一（住所振り分け、フェイルセーフ、メモ、メール整形など）
+# google2atena.py  v3.9.18r7b+phonefix+mailfix  (Render安定版 / no-pandas)
+# - 電話番号整形 改善
+# - メール整形 改善
+# - バージョン表記追加
+# - 他の機能・構造は v3.9.18r7b と完全同一
 
 import csv
 import io
@@ -31,7 +33,7 @@ except Exception:
 
 app = Flask(__name__)
 
-# ======== 住所ユーティリティ ========
+# ======== 住所ユーティリティ（変更なし） ========
 
 def to_zenkaku_for_address(s: str) -> str:
     if not s:
@@ -100,9 +102,8 @@ def route_address_by_label(row, out):
         out['会社住所2'] = addr2
         out['会社住所3'] = ""
 
-# ======== 電話番号整形 ========
+# ======== 電話番号整形（修正版） ========
 
-# 全国市外局番パターン（抜粋・代表）
 CITY_CODES = [
     '011','015','017','018','019','022','023','024','025','026','027','028','029',
     '03','04','042','043','044','045','046','047','048','049','052','053','054',
@@ -116,53 +117,49 @@ def normalize_phones(phone_values):
     for val in phone_values:
         if not val:
             continue
-        nums = re.sub(r'\D', '', val)
-        if not nums:
-            continue
-        if not nums.startswith('0'):
-            nums = '0' + nums
-
-        formatted = nums
-
-        # 携帯・PHS・IP電話・フリーダイヤル等の特殊系
-        if re.match(r'^0(70|80|90)\d{8}$', nums):
-            formatted = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
-        elif re.match(r'^050\d{8}$', nums):  # IP電話
-            formatted = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
-        elif re.match(r'^(0120|0800|0570)\d{6}$', nums):  # 特番
-            formatted = f"{nums[:4]}-{nums[4:7]}-{nums[7:]}"
-        elif len(nums) == 10:  # 固定電話（市外局番判定）
-            for code in sorted(CITY_CODES, key=len, reverse=True):
-                if nums.startswith(code):
-                    remain = nums[len(code):]
-                    if len(remain) == 7:
-                        formatted = f"{code}-{remain[:3]}-{remain[3:]}"
-                    elif len(remain) == 6:
-                        formatted = f"{code}-{remain[:2]}-{remain[2:]}"
-                    break
-        elif len(nums) == 9:  # 旧地方形式
-            formatted = f"{nums[:2]}-{nums[2:5]}-{nums[5:]}"
-        else:
+        for chunk in re.split(r'[;:／／:::,\s]+', val):
+            nums = re.sub(r'\D', '', chunk)
+            if not nums:
+                continue
+            if not nums.startswith('0'):
+                nums = '0' + nums
             formatted = nums
-
-        if formatted not in phones:
-            phones.append(formatted)
-
+            if re.match(r'^0(70|80|90)\d{8}$', nums):
+                formatted = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
+            elif re.match(r'^050\d{8}$', nums):
+                formatted = f"{nums[:3]}-{nums[3:7]}-{nums[7:]}"
+            elif re.match(r'^(0120|0800|0570)\d{6}$', nums):
+                formatted = f"{nums[:4]}-{nums[4:7]}-{nums[7:]}"
+            elif len(nums) == 10:
+                for code in sorted(CITY_CODES, key=len, reverse=True):
+                    if nums.startswith(code):
+                        remain = nums[len(code):]
+                        if len(remain) == 7:
+                            formatted = f"{code}-{remain[:3]}-{remain[3:]}"
+                        elif len(remain) == 6:
+                            formatted = f"{code}-{remain[:2]}-{remain[2:]}"
+                        break
+            elif len(nums) == 9:
+                formatted = f"{nums[:2]}-{nums[2:5]}-{nums[5:]}"
+            if formatted not in phones:
+                phones.append(formatted)
     return ";".join(phones)
 
-# ======== メール整形 ========
+# ======== メール整形（修正版） ========
 
 def normalize_emails(email_values):
     emails = []
     for val in email_values:
         if not val:
             continue
-        val = val.strip()
-        if val and val not in emails:
-            emails.append(val)
+        parts = re.split(r'[;:／／:::,\s]+', val)
+        for p in parts:
+            p = p.strip()
+            if '@' in p and p not in emails:
+                emails.append(p)
     return ";".join(emails)
 
-# ======== メモ抽出 ========
+# ======== メモ抽出（変更なし） ========
 
 def extract_memos(row):
     memos = []
@@ -176,7 +173,7 @@ def extract_memos(row):
         memos.append(notes)
     return memos
 
-# ======== 会社名かな変換 ========
+# ======== 会社名かな変換（変更なし） ========
 
 def kana_company_name(name):
     if not name:
@@ -196,10 +193,11 @@ html_form = """
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<title>Google→宛名職人 CSV 変換</title>
+<title>Google→宛名職人 CSV 変換 v3.9.18r7b+phonefix+mailfix</title>
 </head>
 <body>
 <h2>Google連絡先 → 宛名職人 CSV 変換ツール</h2>
+<p><b>Version: v3.9.18r7b+phonefix+mailfix (Render安定版 / no-pandas)</b></p>
 <form action="/convert" method="post" enctype="multipart/form-data">
   <input type="file" name="file" accept=".csv" required>
   <input type="submit" value="変換開始">
@@ -243,28 +241,14 @@ def convert():
 
     for row in reader:
         out = {}
-
-        # --- 住所 ---
         route_address_by_label(row, out)
-
-        # --- 電話 ---
         phones = [row.get("Phone 1 - Value", ""), row.get("Phone 2 - Value", "")]
         out["会社電話"] = normalize_phones(phones)
-
-        # --- メール ---
-        emails = [
-            row.get("E-mail 1 - Value", ""),
-            row.get("E-mail 2 - Value", ""),
-            row.get("E-mail 3 - Value", "")
-        ]
+        emails = [row.get("E-mail 1 - Value", ""), row.get("E-mail 2 - Value", ""), row.get("E-mail 3 - Value", "")]
         out["会社E-mail"] = normalize_emails(emails)
-
-        # --- メモ ---
         memos = extract_memos(row)
         for i in range(5):
             out[f"メモ{i+1}"] = memos[i] if i < len(memos) else ""
-
-        # --- 会社名かな ---
         company_name = row.get("Organization Name", "")
         out["会社名"] = company_name
         out["会社名かな"] = kana_company_name(company_name)
